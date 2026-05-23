@@ -1,0 +1,114 @@
+// Command ingest is the HTTP telemetry ingest API (device API keys).
+//
+//	DATABASE_URL=... ADDR=:4080 go run ./cmd/ingest
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/iag/fleet-iot/iot"
+	"github.com/iag/fleet-iot/pg"
+)
+
+func main() {
+	configureLogger()
+	if os.Getenv("GIN_MODE") == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		if p := os.Getenv("PORT"); p != "" {
+			addr = ":" + p
+		} else {
+			addr = ":4080"
+		}
+	}
+
+	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	pool, err := pg.Connect(connectCtx, "")
+	cancel()
+	if err != nil {
+		slog.Error("connect Postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := iot.NewStore(pool)
+	hub := iot.NewHubFromEnv()
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/ready", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.POST("/v1/pings", func(c *gin.Context) { handlePings(c, store, hub) })
+	// Legacy path alias for relays configured against fleet /api/iot/pings.
+	r.POST("/api/iot/pings", func(c *gin.Context) { handlePings(c, store, hub) })
+
+	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		slog.Info("telemetry HTTP ingest listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("listen", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	sig := <-stop
+	slog.Info("shutdown", "signal", sig.String())
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelShutdown()
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
+	apiKey := bearerToken(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization: Bearer <api-key>"})
+		return
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	n, err := iot.IngestHTTPBatch(c.Request.Context(), store, hub, apiKey, body, c.ClientIP())
+	if err != nil {
+		if errors.Is(err, iot.ErrInvalidAPIKey) || errors.Is(err, iot.ErrInactiveDevice) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid device api key"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"accepted": n})
+}
+
+func bearerToken(c *gin.Context) string {
+	h := c.GetHeader("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+}
+
+func configureLogger() {
+	var h slog.Handler
+	if os.Getenv("LOG_FORMAT") == "json" {
+		h = slog.NewJSONHandler(os.Stderr, nil)
+	} else {
+		h = slog.NewTextHandler(os.Stderr, nil)
+	}
+	slog.SetDefault(slog.New(h))
+}

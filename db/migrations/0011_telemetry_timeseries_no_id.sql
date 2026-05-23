@@ -1,0 +1,1 @@
+ALTER TABLE IF EXISTS telemetry_timeseries DROP COLUMN IF EXISTS id;

@@ -48,6 +48,7 @@ func main() {
 
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(securityHeaders())
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.GET("/ready", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.POST("/v1/pings", func(c *gin.Context) { handlePings(c, store, hub) })
@@ -93,6 +94,30 @@ func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"accepted": n})
+}
+
+// securityHeaders emits the platform-wide baseline browser security header
+// set. CSP is strict (no inline scripts, no framing, no form submission, no
+// external resource loading) because the telemetry ingest API is JSON-only:
+// it returns either {"accepted": n} or an error object, never HTML or static
+// assets.
+//
+// HSTS is gated on TLS termination (direct TLS or trusted X-Forwarded-Proto)
+// so plain-HTTP dev environments (http://localhost) do not lock browsers
+// into HTTPS for the developer's whole domain.
+func securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Permissions-Policy", "geolocation=(), microphone=(), camera=(), interest-cohort=()")
+		c.Header("X-XSS-Protection", "1; mode=block")
+		if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+		}
+		c.Next()
+	}
 }
 
 func bearerToken(c *gin.Context) string {

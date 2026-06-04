@@ -91,6 +91,7 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 	}
 	if newest := newestPing(pings); newest != nil && newest.VehicleID != "" {
 		_ = store.SyncVehicleFromPing(ctx, *newest)
+		_ = store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest))
 	}
 	_ = store.MarkSeen(ctx, device.ID, clientIP)
 	if hub != nil {

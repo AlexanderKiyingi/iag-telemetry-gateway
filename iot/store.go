@@ -248,44 +248,57 @@ func (s *Store) MarkSeen(ctx context.Context, deviceID int64, ip string) error {
 
 // ──────────────────────────────── Pings ────────────────────────────────
 
-// InsertPings persists a batch atomically. vehicle_id falls back to the
-// device's bound vehicle when the caller didn't set it explicitly.
-//
-// CopyFrom is used when count > 8 — pgx batches it into one COPY
-// statement, dramatically faster than N round-trips.
+// InsertPings persists a batch. Duplicate (vehicle_id, ts) rows are skipped
+// when migration 0015 unique index is present.
 func (s *Store) InsertPings(ctx context.Context, pings []Ping) (int, error) {
 	if len(pings) == 0 {
 		return 0, nil
 	}
-
-	rows := make([][]any, 0, len(pings))
+	batch := &pgx.Batch{}
 	for _, p := range pings {
 		raw := p.Raw
 		if len(raw) == 0 {
 			raw = json.RawMessage(`{}`)
 		}
-		rows = append(rows, []any{
+		batch.Queue(sqlInsertPing,
 			p.VehicleID, p.DeviceID, p.TS, p.Lat, p.Lng,
 			p.Altitude, p.Heading, p.SpeedKmh, p.Satellites,
 			p.Odo, p.FuelLevel, p.Ignition, p.EventID, raw,
-		})
+		)
 	}
-
-	cols := []string{
-		"vehicle_id", "device_id", "ts", "lat", "lng",
-		"altitude", "heading", "speed_kmh", "satellites",
-		"odo", "fuel_level", "ignition", "event_id", "raw",
+	br := s.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	inserted := 0
+	for range pings {
+		tag, err := br.Exec()
+		if err != nil {
+			return inserted, fmt.Errorf("insert ping: %w", err)
+		}
+		inserted += int(tag.RowsAffected())
 	}
+	return inserted, nil
+}
 
-	n, err := s.pool.CopyFrom(ctx,
-		pgx.Identifier{PingsTable},
-		cols,
-		pgx.CopyFromRows(rows),
-	)
+// ListDailySummaries returns telemetry_daily rows for one vehicle in [from, to] (UTC dates).
+func (s *Store) ListDailySummaries(ctx context.Context, vehicleID string, from, to time.Time) ([]DailySummary, error) {
+	rows, err := s.pool.Query(ctx, sqlListDaily, vehicleID, from.UTC(), to.UTC())
 	if err != nil {
-		return 0, fmt.Errorf("copy pings: %w", err)
+		return nil, err
 	}
-	return int(n), nil
+	defer rows.Close()
+	var out []DailySummary
+	for rows.Next() {
+		var sum DailySummary
+		if err := rows.Scan(
+			&sum.VehicleID, &sum.Day, &sum.PingCount, &sum.DistanceKm,
+			&sum.MaxSpeedKmh, &sum.AvgSpeedKmh, &sum.FuelUsedLitres,
+			&sum.MovingMinutes, &sum.IdleMinutes, &sum.FirstPing, &sum.LastPing,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, sum)
+	}
+	return out, rows.Err()
 }
 
 // LatestPing returns the most recent ping for a vehicle, or nil if none.
@@ -299,8 +312,8 @@ func (s *Store) LatestPing(ctx context.Context, vehicleID string) (*Ping, error)
 }
 
 // Track returns pings for a vehicle in [from, to], oldest first, capped at
-// limit (default 5000) so a runaway client can't pull years of history.
-func (s *Store) Track(ctx context.Context, vehicleID string, from, to time.Time, limit int) ([]Ping, error) {
+// limit (default 5000). When after is non-nil, only pings with ts > after are returned (cursor pagination).
+func (s *Store) Track(ctx context.Context, vehicleID string, from, to time.Time, limit int, after *time.Time) ([]Ping, error) {
 	maxRows := MaxTrackRowLimit()
 	if limit <= 0 {
 		limit = 5000
@@ -308,7 +321,13 @@ func (s *Store) Track(ctx context.Context, vehicleID string, from, to time.Time,
 	if limit > maxRows {
 		limit = maxRows
 	}
-	rows, err := s.pool.Query(ctx, sqlTrackPings, vehicleID, from, to, limit)
+	var rows pgx.Rows
+	var err error
+	if after != nil && !after.IsZero() {
+		rows, err = s.pool.Query(ctx, sqlTrackPingsAfter, vehicleID, *after, from, to, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, sqlTrackPings, vehicleID, from, to, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -634,6 +653,10 @@ func (s *Store) PurgeBefore(ctx context.Context, cutoff time.Time) (int64, error
 // Best-effort: we ignore "vehicle not found" since pings can arrive before
 // admins register the unit.
 func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) error {
+	speed := 0.0
+	if p.SpeedKmh != nil {
+		speed = *p.SpeedKmh
+	}
 	const q = `
         UPDATE vehicles SET
             lat       = $2,
@@ -642,10 +665,33 @@ func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) error {
             speed     = COALESCE($5, speed),
             fuel      = COALESCE($6, fuel),
             odo       = COALESCE($7, odo),
-            last_seen = $8
+            last_seen = $8,
+            status    = CASE
+                WHEN status = 'maintenance' THEN status
+                WHEN $9 >= $10::float8 THEN 'moving'
+                ELSE 'idle'
+            END
         WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q, p.VehicleID, p.Lat, p.Lng, p.Heading, p.SpeedKmh, p.FuelLevel, p.Odo, p.TS)
+	_, err := s.pool.Exec(ctx, q,
+		p.VehicleID, p.Lat, p.Lng, p.Heading, p.SpeedKmh, p.FuelLevel, p.Odo, p.TS,
+		speed, movingThresholdKmh,
+	)
 	return err
+}
+
+// MarkStaleVehiclesOffline sets status=offline when last_seen is older than cutoff
+// and the vehicle is not in maintenance. Returns rows updated.
+func (s *Store) MarkStaleVehiclesOffline(ctx context.Context, cutoff time.Time) (int64, error) {
+	const q = `
+        UPDATE vehicles SET status = 'offline'
+        WHERE status IN ('moving', 'idle')
+          AND last_seen IS NOT NULL
+          AND last_seen < $1`
+	tag, err := s.pool.Exec(ctx, q, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // ──────────────────────────────── helpers ────────────────────────────────

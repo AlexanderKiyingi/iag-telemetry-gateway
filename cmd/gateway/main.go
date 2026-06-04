@@ -140,6 +140,7 @@ func (g *tcpGateway) handle(conn net.Conn) {
 				}
 			}
 			_ = g.store.SyncVehicleFromPing(ctx, newest)
+			_ = g.store.ApplyGeofenceTransitions(ctx, iot.ProcessGeofences(newest))
 		}
 		_ = g.store.MarkSeen(ctx, device.ID, ipOnly(remote))
 		_ = iot.WriteACK(conn, len(records))

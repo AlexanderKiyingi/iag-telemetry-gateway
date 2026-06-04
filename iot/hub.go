@@ -54,7 +54,7 @@ func (h *Hub) Publish(p Ping) {
 	}
 }
 
-// Subscribe returns pings for one vehicle (local + Redis).
+// Subscribe returns pings for one vehicle. Uses Redis when configured, else in-process broker.
 func (h *Hub) Subscribe(vehicleID string) (<-chan Ping, func()) {
 	if h == nil {
 		ch := make(chan Ping)
@@ -62,13 +62,6 @@ func (h *Hub) Subscribe(vehicleID string) (<-chan Ping, func()) {
 		return ch, func() {}
 	}
 	out := make(chan Ping, 32)
-	localCh, localCancel := h.local.Subscribe(vehicleID)
-
-	var (
-		redisCancel context.CancelFunc
-		wg          sync.WaitGroup
-	)
-
 	forward := func(p Ping) {
 		select {
 		case out <- p:
@@ -76,6 +69,30 @@ func (h *Hub) Subscribe(vehicleID string) (<-chan Ping, func()) {
 		}
 	}
 
+	if h.redis != nil {
+		ctx, redisCancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sub := h.redis.Subscribe(ctx, redisVehicleChannelPrefix+vehicleID)
+			defer func() { _ = sub.Close() }()
+			for msg := range sub.Channel() {
+				var p Ping
+				if json.Unmarshal([]byte(msg.Payload), &p) == nil {
+					forward(p)
+				}
+			}
+		}()
+		return out, func() {
+			redisCancel()
+			wg.Wait()
+			close(out)
+		}
+	}
+
+	localCh, localCancel := h.local.Subscribe(vehicleID)
+	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -83,71 +100,66 @@ func (h *Hub) Subscribe(vehicleID string) (<-chan Ping, func()) {
 			forward(p)
 		}
 	}()
-
-	if h.redis != nil {
-		var ctx context.Context
-		ctx, redisCancel = context.WithCancel(context.Background())
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sub := h.redis.Subscribe(ctx, redisVehicleChannelPrefix+vehicleID)
-			defer func() { _ = sub.Close() }()
-			ch := sub.Channel()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case msg, ok := <-ch:
-					if !ok {
-						return
-					}
-					var p Ping
-					if json.Unmarshal([]byte(msg.Payload), &p) == nil {
-						forward(p)
-					}
-				}
-			}
-		}()
-	}
-
-	cancel := func() {
+	return out, func() {
 		localCancel()
-		if redisCancel != nil {
-			redisCancel()
-		}
 		wg.Wait()
 		close(out)
 	}
-	return out, cancel
 }
 
-// SubscribeLive receives any vehicle ping published to the fleet live channel.
+// SubscribeLive receives any vehicle ping. With Redis, only the pub/sub channel
+// is used (avoids duplicate delivery when ingest and API share a process). Without
+// Redis, the in-process broker is used.
 func (h *Hub) SubscribeLive() (<-chan Ping, func()) {
-	if h == nil || h.redis == nil {
+	if h == nil {
 		ch := make(chan Ping)
 		close(ch)
 		return ch, func() {}
 	}
 	out := make(chan Ping, 64)
-	ctx, cancel := context.WithCancel(context.Background())
-	wg := sync.WaitGroup{}
+	forward := func(p Ping) {
+		if p.VehicleID == "" {
+			return
+		}
+		select {
+		case out <- p:
+		default:
+		}
+	}
+
+	if h.redis != nil {
+		ctx, redisCancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sub := h.redis.Subscribe(ctx, redisLiveChannel)
+			defer func() { _ = sub.Close() }()
+			for msg := range sub.Channel() {
+				var p Ping
+				if json.Unmarshal([]byte(msg.Payload), &p) == nil {
+					forward(p)
+				}
+			}
+		}()
+		return out, func() {
+			redisCancel()
+			wg.Wait()
+			close(out)
+		}
+	}
+
+	localCh, localCancel := h.local.SubscribeLive()
+	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sub := h.redis.Subscribe(ctx, redisLiveChannel)
-		defer func() { _ = sub.Close() }()
-		for msg := range sub.Channel() {
-			var p Ping
-			if json.Unmarshal([]byte(msg.Payload), &p) == nil && p.VehicleID != "" {
-				select {
-				case out <- p:
-				default:
-				}
-			}
+		for p := range localCh {
+			forward(p)
 		}
 	}()
 	return out, func() {
-		cancel()
+		localCancel()
 		wg.Wait()
 		close(out)
 	}

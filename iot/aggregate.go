@@ -105,7 +105,7 @@ func aggregateAndDetect(vehicleID string, day time.Time, pings []Ping, tankCapac
 			continue
 		}
 		prev := pings[i-1]
-		distanceKm += haversineKm(prev.Lat, prev.Lng, p.Lat, p.Lng)
+		distanceKm += HaversineKm(prev.Lat, prev.Lng, p.Lat, p.Lng)
 
 		// Classify the gap [prev.TS, p.TS] using the average of the two
 		// endpoint speeds (when both known). Otherwise fall back to whichever
@@ -221,18 +221,4 @@ func buildFuelEvent(kind, vehicleID string, p Ping, before, after, delta float64
 		}
 	}
 	return ev
-}
-
-// haversineKm returns the great-circle distance between two coordinates
-// in kilometres. R is the standard mean Earth radius.
-func haversineKm(lat1, lng1, lat2, lng2 float64) float64 {
-	const R = 6371.0
-	rad := math.Pi / 180
-	dLat := (lat2 - lat1) * rad
-	dLng := (lng2 - lng1) * rad
-	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
-		math.Cos(lat1*rad)*math.Cos(lat2*rad)*
-			math.Sin(dLng/2)*math.Sin(dLng/2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	return R * c
 }

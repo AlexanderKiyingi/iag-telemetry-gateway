@@ -10,12 +10,31 @@ import "sync"
 // for a shared pubsub (Redis PUBLISH telemetry:<vehicleId>, NATS, etc.) —
 // the public methods are the integration boundary.
 type Broker struct {
-	mu   sync.RWMutex
-	subs map[string]map[chan Ping]struct{} // vehicleID → set of subscribers
+	mu       sync.RWMutex
+	subs     map[string]map[chan Ping]struct{} // vehicleID → set of subscribers
+	liveSubs map[chan Ping]struct{}            // fleet-wide live map subscribers
 }
 
 func NewBroker() *Broker {
-	return &Broker{subs: make(map[string]map[chan Ping]struct{})}
+	return &Broker{
+		subs:     make(map[string]map[chan Ping]struct{}),
+		liveSubs: make(map[chan Ping]struct{}),
+	}
+}
+
+// SubscribeLive receives every ping published on this process (all vehicles).
+func (b *Broker) SubscribeLive() (<-chan Ping, func()) {
+	ch := make(chan Ping, 64)
+	b.mu.Lock()
+	b.liveSubs[ch] = struct{}{}
+	b.mu.Unlock()
+	cancel := func() {
+		b.mu.Lock()
+		delete(b.liveSubs, ch)
+		b.mu.Unlock()
+		close(ch)
+	}
+	return ch, cancel
 }
 
 // Subscribe returns a buffered channel that receives every Ping published
@@ -57,7 +76,12 @@ func (b *Broker) Publish(p Ping) {
 		select {
 		case ch <- p:
 		default:
-			// subscriber too slow; drop
+		}
+	}
+	for ch := range b.liveSubs {
+		select {
+		case ch <- p:
+		default:
 		}
 	}
 }

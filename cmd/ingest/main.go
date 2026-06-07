@@ -90,7 +90,7 @@ func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	n, err := iot.IngestHTTPBatch(c.Request.Context(), store, hub, apiKey, body, c.ClientIP())
+	res, err := iot.IngestHTTPBatch(c.Request.Context(), store, hub, apiKey, body, c.ClientIP())
 	if err != nil {
 		if errors.Is(err, iot.ErrInvalidAPIKey) || errors.Is(err, iot.ErrInactiveDevice) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid device api key"})
@@ -99,7 +99,7 @@ func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"accepted": n})
+	c.JSON(http.StatusAccepted, res)
 }
 
 // securityHeaders emits the platform-wide baseline browser security header

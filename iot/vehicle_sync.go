@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -80,6 +80,20 @@ func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) (StatusSyncResu
 	}
 	res.Changed = res.PreviousStatus != res.NewStatus
 	return res, nil
+}
+
+// ApplyVehicleHotState syncs registry position/status from a ping and enqueues
+// status-change events. Returns the sync result; logs publish failures.
+func (s *Store) ApplyVehicleHotState(ctx context.Context, p Ping) (StatusSyncResult, error) {
+	syncRes, err := s.SyncVehicleFromPing(ctx, p)
+	if err != nil {
+		return StatusSyncResult{}, err
+	}
+	if err := s.PublishStatusChange(ctx, syncRes); err != nil {
+		slog.Warn("fleet status outbox enqueue failed",
+			"vehicleId", p.VehicleID, "err", err)
+	}
+	return syncRes, nil
 }
 
 // StatusChange is one vehicle whose registry status was updated.
@@ -158,15 +172,7 @@ func (s *Store) enqueueFleetEvent(ctx context.Context, eventType, key string, da
 	if !eventBusEnabled() {
 		return nil
 	}
-	evt := map[string]any{
-		"id":            uuid.NewString(),
-		"type":          eventType,
-		"time":          time.Now().UTC().Format(time.RFC3339Nano),
-		"source":        fleetEventSource,
-		"specversion":   fleetEventSpecVersion,
-		"data":          data,
-	}
-	body, err := json.Marshal(evt)
+	body, err := json.Marshal(newPlatformEvent(eventType, data))
 	if err != nil {
 		return err
 	}

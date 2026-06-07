@@ -145,8 +145,9 @@ func (g *tcpGateway) handle(conn net.Conn) {
 					newest = p
 				}
 			}
-			if syncRes, err := g.store.SyncVehicleFromPing(ctx, newest); err == nil {
-				_ = g.store.PublishStatusChange(ctx, syncRes)
+			if _, err := g.store.ApplyVehicleHotState(ctx, newest); err != nil {
+				logger.Warn("registry sync failed after TCP ingest",
+					"vehicleId", device.VehicleID, "err", err)
 			}
 			_ = g.store.ApplyGeofenceTransitions(ctx, iot.ProcessGeofences(newest))
 		}

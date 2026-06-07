@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -28,12 +29,20 @@ type IngestPingBody struct {
 	Raw        json.RawMessage `json:"raw"`
 }
 
+// IngestBatchResult is the HTTP ingest outcome. Pings are persisted even when
+// registry sync fails; callers can inspect RegistrySync* for partial failures.
+type IngestBatchResult struct {
+	Accepted            int    `json:"accepted"`
+	RegistrySyncFailed  bool   `json:"registrySyncFailed,omitempty"`
+	RegistrySyncError   string `json:"registrySyncError,omitempty"`
+}
+
 // IngestHTTPBatch authenticates via device API key, validates, persists pings,
 // syncs vehicle hot-state, and publishes to the telemetry hub.
-func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string, body []byte, clientIP string) (accepted int, err error) {
+func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string, body []byte, clientIP string) (IngestBatchResult, error) {
 	device, err := store.AuthenticateAPIKey(ctx, apiKey)
 	if err != nil {
-		return 0, err
+		return IngestBatchResult{}, err
 	}
 	body = []byte(strings.TrimSpace(string(body)))
 	if len(body) > 0 && body[0] == '{' {
@@ -41,13 +50,13 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 	}
 	var batch []IngestPingBody
 	if err := json.Unmarshal(body, &batch); err != nil {
-		return 0, fmt.Errorf("malformed body: %w", err)
+		return IngestBatchResult{}, fmt.Errorf("malformed body: %w", err)
 	}
 	if len(batch) == 0 {
-		return 0, fmt.Errorf("empty batch")
+		return IngestBatchResult{}, fmt.Errorf("empty batch")
 	}
 	if len(batch) > MaxIngestBatch {
-		return 0, fmt.Errorf("batch exceeds %d pings", MaxIngestBatch)
+		return IngestBatchResult{}, fmt.Errorf("batch exceeds %d pings", MaxIngestBatch)
 	}
 	now := time.Now().UTC()
 	pings := make([]Ping, 0, len(batch))
@@ -57,20 +66,20 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 			vehicleID = device.VehicleID
 		}
 		if vehicleID == "" {
-			return 0, fmt.Errorf("vehicleId required (device has no default binding)")
+			return IngestBatchResult{}, fmt.Errorf("vehicleId required (device has no default binding)")
 		}
 		if b.Lat < -90 || b.Lat > 90 || b.Lng < -180 || b.Lng > 180 {
-			return 0, fmt.Errorf("invalid coordinates")
+			return IngestBatchResult{}, fmt.Errorf("invalid coordinates")
 		}
 		ts := b.TS
 		if ts.IsZero() {
 			ts = now
 		} else {
 			if ts.Before(now.Add(-24 * time.Hour)) {
-				return 0, fmt.Errorf("timestamp too old")
+				return IngestBatchResult{}, fmt.Errorf("timestamp too old")
 			}
 			if ts.After(now.Add(5 * time.Minute)) {
-				return 0, fmt.Errorf("timestamp in the future")
+				return IngestBatchResult{}, fmt.Errorf("timestamp in the future")
 			}
 		}
 		raw := b.Raw
@@ -87,11 +96,15 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 	}
 	n, err := store.InsertPings(ctx, pings)
 	if err != nil {
-		return 0, err
+		return IngestBatchResult{}, err
 	}
+	result := IngestBatchResult{Accepted: n}
 	if newest := newestPing(pings); newest != nil && newest.VehicleID != "" {
-		if syncRes, err := store.SyncVehicleFromPing(ctx, *newest); err == nil {
-			_ = store.PublishStatusChange(ctx, syncRes)
+		if _, err := store.ApplyVehicleHotState(ctx, *newest); err != nil {
+			slog.Warn("registry sync failed after ingest",
+				"vehicleId", newest.VehicleID, "err", err)
+			result.RegistrySyncFailed = true
+			result.RegistrySyncError = err.Error()
 		}
 		_ = store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest))
 	}
@@ -101,7 +114,7 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 			hub.Publish(p)
 		}
 	}
-	return n, nil
+	return result, nil
 }
 
 // ReadIngestBody reads and normalizes a request body for IngestHTTPBatch.

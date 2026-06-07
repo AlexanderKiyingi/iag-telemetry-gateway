@@ -35,15 +35,21 @@ func main() {
 	}
 
 	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	pool, err := pg.Connect(connectCtx, "")
+	registryPool, telemetryPool, err := pg.ConnectSplit(connectCtx)
 	cancel()
 	if err != nil {
 		slog.Error("connect Postgres", "err", err)
 		os.Exit(1)
 	}
-	defer pool.Close()
+	defer registryPool.Close()
+	if telemetryPool != registryPool {
+		defer telemetryPool.Close()
+	}
 
-	store := iot.NewStore(pool)
+	store := iot.NewSplitStore(registryPool, telemetryPool)
+	if os.Getenv("REGISTRY_DATABASE_URL") != "" {
+		slog.Info("telemetry ingest: split DB (registry + telemetry)")
+	}
 	hub := iot.NewHubFromEnv()
 
 	r := gin.New()

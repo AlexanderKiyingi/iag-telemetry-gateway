@@ -1,4 +1,4 @@
-// Package pg opens the shared Postgres pool used by fleet telemetry tables.
+// Package pg opens Postgres pools for fleet telemetry ingest.
 package pg
 
 import (
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,6 +42,25 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 	return pool, nil
+}
+
+// ConnectSplit opens registry (REGISTRY_DATABASE_URL) and telemetry (DATABASE_URL) pools.
+// When REGISTRY_DATABASE_URL is unset, both pointers reference the same pool (single-DB dev).
+func ConnectSplit(ctx context.Context) (registry, telemetry *pgxpool.Pool, err error) {
+	telemetry, err = Connect(ctx, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	registryURL := strings.TrimSpace(os.Getenv("REGISTRY_DATABASE_URL"))
+	if registryURL == "" {
+		return telemetry, telemetry, nil
+	}
+	registry, err = Connect(ctx, registryURL)
+	if err != nil {
+		telemetry.Close()
+		return nil, nil, err
+	}
+	return registry, telemetry, nil
 }
 
 func intEnv(key string, fallback int32) int32 {

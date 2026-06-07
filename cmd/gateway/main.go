@@ -28,15 +28,21 @@ func main() {
 		addr = ":5027"
 	}
 	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	pool, err := pg.Connect(connectCtx, "")
+	registryPool, telemetryPool, err := pg.ConnectSplit(connectCtx)
 	cancel()
 	if err != nil {
 		slog.Error("connect Postgres", "err", err)
 		os.Exit(1)
 	}
-	defer pool.Close()
+	defer registryPool.Close()
+	if telemetryPool != registryPool {
+		defer telemetryPool.Close()
+	}
 
-	store := iot.NewStore(pool)
+	store := iot.NewSplitStore(registryPool, telemetryPool)
+	if os.Getenv("REGISTRY_DATABASE_URL") != "" {
+		slog.Info("telemetry TCP gateway: split DB (registry + telemetry)")
+	}
 	hub := iot.NewHubFromEnv()
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -139,7 +145,9 @@ func (g *tcpGateway) handle(conn net.Conn) {
 					newest = p
 				}
 			}
-			_ = g.store.SyncVehicleFromPing(ctx, newest)
+			if syncRes, err := g.store.SyncVehicleFromPing(ctx, newest); err == nil {
+				_ = g.store.PublishStatusChange(ctx, syncRes)
+			}
 			_ = g.store.ApplyGeofenceTransitions(ctx, iot.ProcessGeofences(newest))
 		}
 		_ = g.store.MarkSeen(ctx, device.ID, ipOnly(remote))

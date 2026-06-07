@@ -56,7 +56,7 @@ func (s *Store) ApplyGeofenceTransitions(ctx context.Context, transitions []Geof
 
 func (s *Store) geofenceWasInside(ctx context.Context, vehicleID, poiName string) (inside bool, known bool, err error) {
 	const q = `SELECT inside FROM vehicle_geofence_state WHERE vehicle_id = $1 AND poi_name = $2`
-	err = s.pool.QueryRow(ctx, q, vehicleID, poiName).Scan(&inside)
+	err = s.op().QueryRow(ctx, q, vehicleID, poiName).Scan(&inside)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, false, nil
@@ -73,7 +73,7 @@ func (s *Store) upsertGeofenceState(ctx context.Context, vehicleID, poiName stri
         ON CONFLICT (vehicle_id, poi_name) DO UPDATE SET
             inside = EXCLUDED.inside,
             updated_at = EXCLUDED.updated_at`
-	_, err := s.pool.Exec(ctx, q, vehicleID, poiName, inside, ts)
+	_, err := s.op().Exec(ctx, q, vehicleID, poiName, inside, ts)
 	return err
 }
 
@@ -94,7 +94,7 @@ func (s *Store) insertGeofenceSafetyEvent(ctx context.Context, tr GeofenceTransi
             id, vehicle_id, date, type, severity, status, location, description, reported_by, status_history
         ) VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, 'Geofence', '[]'::jsonb)
         ON CONFLICT (id) DO NOTHING`
-	_, err := s.pool.Exec(ctx, q, id, tr.Ping.VehicleID, tr.Ping.TS, eventType, severity, loc, desc)
+	_, err := s.op().Exec(ctx, q, id, tr.Ping.VehicleID, tr.Ping.TS, eventType, severity, loc, desc)
 	return err
 }
 

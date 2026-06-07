@@ -22,12 +22,33 @@ var (
 	ErrInactiveDevice = errors.New("device inactive")
 )
 
+// Store holds Postgres pools for fleet telemetry and operational registry data.
+// When telemetry is nil, all queries use operational (single-DB dev mode).
 type Store struct {
-	pool *pgxpool.Pool
+	operational *pgxpool.Pool
+	telemetry   *pgxpool.Pool
 }
 
+// NewStore wires one pool for both operational and telemetry tables (local dev).
 func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return NewSplitStore(pool, nil)
+}
+
+// NewSplitStore separates registry/hot-state (operational) from time-series (telemetry).
+func NewSplitStore(operational, telemetry *pgxpool.Pool) *Store {
+	if operational == nil {
+		operational = telemetry
+	}
+	return &Store{operational: operational, telemetry: telemetry}
+}
+
+func (s *Store) op() *pgxpool.Pool { return s.operational }
+
+func (s *Store) tel() *pgxpool.Pool {
+	if s.telemetry != nil {
+		return s.telemetry
+	}
+	return s.operational
 }
 
 // ─────────────────────────────── Devices ────────────────────────────────
@@ -60,7 +81,7 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
         RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
                   api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
 	var d Device
-	err := s.pool.QueryRow(ctx, q, in.Serial, in.Label, in.VehicleID, keyHash).Scan(
+	err := s.op().QueryRow(ctx, q, in.Serial, in.Label, in.VehicleID, keyHash).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 	)
@@ -75,7 +96,7 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
         SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices ORDER BY created_at DESC`
-	rows, err := s.pool.Query(ctx, q)
+	rows, err := s.op().Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +121,7 @@ func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices WHERE id = $1`
 	var d Device
-	err := s.pool.QueryRow(ctx, q, id).Scan(
+	err := s.op().QueryRow(ctx, q, id).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 	)
@@ -119,7 +140,7 @@ func (s *Store) FindBySerial(ctx context.Context, serial string) (*Device, error
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices WHERE serial = $1`
 	var d Device
-	err := s.pool.QueryRow(ctx, q, serial).Scan(
+	err := s.op().QueryRow(ctx, q, serial).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 	)
@@ -148,7 +169,7 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, plaintext string) (*Devi
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices WHERE api_key_hash = $1`
 	var d Device
-	err := s.pool.QueryRow(ctx, q, digest).Scan(
+	err := s.op().QueryRow(ctx, q, digest).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 	)
@@ -197,7 +218,7 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
         RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
                   api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
 	var d Device
-	err := s.pool.QueryRow(ctx, q, id, labelSet, labelVal, vehicleSet, vehicleVal, activeSet, activeVal).Scan(
+	err := s.op().QueryRow(ctx, q, id, labelSet, labelVal, vehicleSet, vehicleVal, activeSet, activeVal).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 	)
@@ -208,7 +229,7 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
 }
 
 func (s *Store) DeleteDevice(ctx context.Context, id int64) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM iot_devices WHERE id = $1`, id)
+	tag, err := s.op().Exec(ctx, `DELETE FROM iot_devices WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -226,7 +247,7 @@ func (s *Store) RotateAPIKey(ctx context.Context, id int64) (string, error) {
 		return "", err
 	}
 	plaintext := base64.RawURLEncoding.EncodeToString(buf)
-	tag, err := s.pool.Exec(ctx,
+	tag, err := s.op().Exec(ctx,
 		`UPDATE iot_devices SET api_key_hash = $1 WHERE id = $2`,
 		hashAPIKey(plaintext), id)
 	if err != nil {
@@ -239,7 +260,7 @@ func (s *Store) RotateAPIKey(ctx context.Context, id int64) (string, error) {
 }
 
 func (s *Store) MarkSeen(ctx context.Context, deviceID int64, ip string) error {
-	_, err := s.pool.Exec(ctx,
+	_, err := s.op().Exec(ctx,
 		`UPDATE iot_devices SET last_seen = NOW(), last_ip = NULLIF($2, '') WHERE id = $1`,
 		deviceID, ip,
 	)
@@ -266,7 +287,7 @@ func (s *Store) InsertPings(ctx context.Context, pings []Ping) (int, error) {
 			p.Odo, p.FuelLevel, p.Ignition, p.EventID, raw,
 		)
 	}
-	br := s.pool.SendBatch(ctx, batch)
+	br := s.tel().SendBatch(ctx, batch)
 	defer br.Close()
 	inserted := 0
 	for range pings {
@@ -281,7 +302,7 @@ func (s *Store) InsertPings(ctx context.Context, pings []Ping) (int, error) {
 
 // ListDailySummaries returns telemetry_daily rows for one vehicle in [from, to] (UTC dates).
 func (s *Store) ListDailySummaries(ctx context.Context, vehicleID string, from, to time.Time) ([]DailySummary, error) {
-	rows, err := s.pool.Query(ctx, sqlListDaily, vehicleID, from.UTC(), to.UTC())
+	rows, err := s.tel().Query(ctx, sqlListDaily, vehicleID, from.UTC(), to.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +324,7 @@ func (s *Store) ListDailySummaries(ctx context.Context, vehicleID string, from, 
 
 // LatestPing returns the most recent ping for a vehicle, or nil if none.
 func (s *Store) LatestPing(ctx context.Context, vehicleID string) (*Ping, error) {
-	row := s.pool.QueryRow(ctx, sqlLatestPing, vehicleID)
+	row := s.tel().QueryRow(ctx, sqlLatestPing, vehicleID)
 	p, err := scanPing(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -324,9 +345,9 @@ func (s *Store) Track(ctx context.Context, vehicleID string, from, to time.Time,
 	var rows pgx.Rows
 	var err error
 	if after != nil && !after.IsZero() {
-		rows, err = s.pool.Query(ctx, sqlTrackPingsAfter, vehicleID, *after, from, to, limit)
+		rows, err = s.tel().Query(ctx, sqlTrackPingsAfter, vehicleID, *after, from, to, limit)
 	} else {
-		rows, err = s.pool.Query(ctx, sqlTrackPings, vehicleID, from, to, limit)
+		rows, err = s.tel().Query(ctx, sqlTrackPings, vehicleID, from, to, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -349,7 +370,7 @@ func (s *Store) Track(ctx context.Context, vehicleID string, from, to time.Time,
 func (s *Store) PingsForDay(ctx context.Context, vehicleID string, day time.Time) ([]Ping, error) {
 	start := day.UTC().Truncate(24 * time.Hour)
 	end := start.Add(24 * time.Hour)
-	rows, err := s.pool.Query(ctx, sqlPingsForDay, vehicleID, start, end)
+	rows, err := s.tel().Query(ctx, sqlPingsForDay, vehicleID, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +394,7 @@ func (s *Store) DistinctVehicleDays(ctx context.Context, from, to time.Time) ([]
 	VehicleID string
 	Day       time.Time
 }, error) {
-	rows, err := s.pool.Query(ctx, sqlDistinctVehicleDays, from, to)
+	rows, err := s.tel().Query(ctx, sqlDistinctVehicleDays, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +435,7 @@ func (s *Store) UpsertDaily(ctx context.Context, sum DailySummary) error {
             idle_minutes     = EXCLUDED.idle_minutes,
             first_ping       = EXCLUDED.first_ping,
             last_ping        = EXCLUDED.last_ping`
-	_, err := s.pool.Exec(ctx, q,
+	_, err := s.tel().Exec(ctx, q,
 		sum.VehicleID, sum.Day, sum.PingCount, sum.DistanceKm,
 		sum.MaxSpeedKmh, sum.AvgSpeedKmh, sum.FuelUsedLitres,
 		sum.MovingMinutes, sum.IdleMinutes, sum.FirstPing, sum.LastPing,
@@ -433,7 +454,7 @@ func (s *Store) VehicleTankCapacities(ctx context.Context, vehicleIDs []string) 
         SELECT id, tank_capacity_litres
         FROM vehicles
         WHERE id = ANY($1) AND tank_capacity_litres IS NOT NULL`
-	rows, err := s.pool.Query(ctx, q, vehicleIDs)
+	rows, err := s.op().Query(ctx, q, vehicleIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +478,7 @@ func (s *Store) InsertFuelEvents(ctx context.Context, events []FuelEvent) (int, 
 	if len(events) == 0 {
 		return 0, nil
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.tel().Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -495,7 +516,7 @@ func (s *Store) FuelHistory(ctx context.Context, vehicleID string, from, to time
 	if limit <= 0 || limit > 50000 {
 		limit = 5000
 	}
-	rows, err := s.pool.Query(ctx, sqlFuelHistory, vehicleID, from, to, limit)
+	rows, err := s.tel().Query(ctx, sqlFuelHistory, vehicleID, from, to, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +548,7 @@ func (s *Store) FuelEvents(ctx context.Context, vehicleID string, from, to time.
           AND ($4 = '' OR kind = $4)
           AND ($5 = '' OR confidence = $5)
         ORDER BY ts DESC LIMIT $6`
-	rows, err := s.pool.Query(ctx, q, vehicleID, from, to, kind, confidence, limit)
+	rows, err := s.tel().Query(ctx, q, vehicleID, from, to, kind, confidence, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +583,7 @@ func (s *Store) FleetFuelAnomalies(ctx context.Context, from, to time.Time, limi
         WHERE ts BETWEEN $1 AND $2
           AND (kind = 'drop' OR (kind = 'refuel' AND confidence = 'low'))
         ORDER BY ts DESC LIMIT $3`
-	rows, err := s.pool.Query(ctx, q, from, to, limit)
+	rows, err := s.tel().Query(ctx, q, from, to, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -608,7 +629,7 @@ func (s *Store) FuelSummary(ctx context.Context, vehicleID string, from, to time
         FROM telemetry_daily
         WHERE vehicle_id = $1 AND day >= $2::date AND day <= $3::date`
 	var fuelUsed *float64
-	if err := s.pool.QueryRow(ctx, q1, vehicleID, from, to).Scan(&out.DistanceKm, &fuelUsed); err != nil {
+	if err := s.tel().QueryRow(ctx, q1, vehicleID, from, to).Scan(&out.DistanceKm, &fuelUsed); err != nil {
 		return nil, err
 	}
 	out.FuelUsedLitres = fuelUsed
@@ -627,7 +648,7 @@ func (s *Store) FuelSummary(ctx context.Context, vehicleID string, from, to time
         FROM fuel_events
         WHERE vehicle_id = $1 AND ts BETWEEN $2 AND $3`
 	var refLitres, dropLitres *float64
-	if err := s.pool.QueryRow(ctx, q2, vehicleID, from, to).Scan(
+	if err := s.tel().QueryRow(ctx, q2, vehicleID, from, to).Scan(
 		&out.RefuelCount, &out.DropCount, &refLitres, &dropLitres,
 	); err != nil {
 		return nil, err
@@ -639,55 +660,7 @@ func (s *Store) FuelSummary(ctx context.Context, vehicleID string, from, to time
 
 // PurgeBefore drops pings older than the cutoff. Called by cmd/telemetry-purge.
 func (s *Store) PurgeBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	tag, err := s.pool.Exec(ctx, sqlPurgeBefore, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
-}
-
-// ─────────────────────────── Vehicle hot-state ─────────────────────────
-
-// SyncVehicleFromPing pushes a ping's position/speed into the vehicles row
-// so the existing API surface keeps reflecting the latest known state.
-// Best-effort: we ignore "vehicle not found" since pings can arrive before
-// admins register the unit.
-func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) error {
-	speed := 0.0
-	if p.SpeedKmh != nil {
-		speed = *p.SpeedKmh
-	}
-	const q = `
-        UPDATE vehicles SET
-            lat       = $2,
-            lng       = $3,
-            heading   = COALESCE($4, heading),
-            speed     = COALESCE($5, speed),
-            fuel      = COALESCE($6, fuel),
-            odo       = COALESCE($7, odo),
-            last_seen = $8,
-            status    = CASE
-                WHEN status = 'maintenance' THEN status
-                WHEN $9 >= $10::float8 THEN 'moving'
-                ELSE 'idle'
-            END
-        WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q,
-		p.VehicleID, p.Lat, p.Lng, p.Heading, p.SpeedKmh, p.FuelLevel, p.Odo, p.TS,
-		speed, movingThresholdKmh,
-	)
-	return err
-}
-
-// MarkStaleVehiclesOffline sets status=offline when last_seen is older than cutoff
-// and the vehicle is not in maintenance. Returns rows updated.
-func (s *Store) MarkStaleVehiclesOffline(ctx context.Context, cutoff time.Time) (int64, error) {
-	const q = `
-        UPDATE vehicles SET status = 'offline'
-        WHERE status IN ('moving', 'idle')
-          AND last_seen IS NOT NULL
-          AND last_seen < $1`
-	tag, err := s.pool.Exec(ctx, q, cutoff)
+	tag, err := s.tel().Exec(ctx, sqlPurgeBefore, cutoff)
 	if err != nil {
 		return 0, err
 	}

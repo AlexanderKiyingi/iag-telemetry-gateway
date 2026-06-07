@@ -40,7 +40,9 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 
 | Variable | Required | Notes |
 |----------|----------|-------|
-| `DATABASE_URL` | yes | Same DB as fleet (`telemetry_timeseries`, `iot_devices`, `vehicles`) |
+| `DATABASE_URL` | yes | Telemetry Timescale (`telemetry_timeseries`, aggregates) |
+| `REGISTRY_DATABASE_URL` | split-DB only | Operational fleet DB — `iot_devices`, `SyncVehicleFromPing` on `vehicles` (same DSN as fleet `DATABASE_URL`) |
+| `EVENT_BUS_ENABLED` | no | When `true`, ingest enqueues `fleet.vehicle.status_changed` to `fleet_event_outbox` on the operational DB |
 | `REDIS_URL` | no | Live SSE fan-out for fleet API replicas |
 | `ADDR` / `PORT` | no | HTTP ingest (default `:4080`) |
 | `IOT_ADDR` | no | TCP gateway (default `:5027`) |

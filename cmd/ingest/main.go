@@ -61,7 +61,14 @@ func main() {
 	// Legacy path alias for relays configured against fleet /api/iot/pings.
 	r.POST("/api/iot/pings", func(c *gin.Context) { handlePings(c, store, hub) })
 
-	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		// Bound total request read time so a slow client streaming the body one
+		// byte at a time cannot pin a connection (slow-loris) indefinitely.
+		ReadTimeout: 30 * time.Second,
+	}
 	go func() {
 		slog.Info("telemetry HTTP ingest listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -79,15 +86,27 @@ func main() {
 	_ = srv.Shutdown(shutdownCtx)
 }
 
+// maxIngestBodyBytes caps a single ingest request body. MaxIngestBatch (1000)
+// pings of telemetry with raw IO maps fit comfortably under this; anything
+// larger is rejected before it is buffered into memory.
+const maxIngestBodyBytes = 8 << 20 // 8 MiB
+
 func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
+	start := time.Now()
 	apiKey := bearerToken(c)
 	if apiKey == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization: Bearer <api-key>"})
 		return
 	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxIngestBodyBytes)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read request body"})
 		return
 	}
 	res, err := iot.IngestHTTPBatch(c.Request.Context(), store, hub, apiKey, body, c.ClientIP())
@@ -96,9 +115,13 @@ func handlePings(c *gin.Context, store *iot.Store, hub *iot.Hub) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid device api key"})
 			return
 		}
+		slog.Warn("ingest rejected", "path", c.FullPath(), "ip", c.ClientIP(),
+			"err", err, "ms", time.Since(start).Milliseconds())
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	slog.Info("ingest accepted", "path", c.FullPath(), "accepted", res.Accepted,
+		"registrySyncFailed", res.RegistrySyncFailed, "ms", time.Since(start).Milliseconds())
 	c.JSON(http.StatusAccepted, res)
 }
 

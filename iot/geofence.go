@@ -19,6 +19,13 @@ type GeofenceTransition struct {
 
 // ProcessGeofences compares the ping position to configured POIs and returns transitions.
 func ProcessGeofences(p Ping) []GeofenceTransition {
+	// A (0,0) position is the classic "no GPS fix" sentinel (open ocean off
+	// West Africa, where no IAG vehicle operates); skip geofence evaluation so a
+	// dropped fix cannot fabricate enter/exit transitions and spurious safety
+	// events.
+	if p.Lat == 0 && p.Lng == 0 {
+		return nil
+	}
 	var out []GeofenceTransition
 	for _, poi := range GeofencePOIs {
 		inside := InsideGeofence(p.Lat, p.Lng, poi.Lat, poi.Lng, poi.RadiusKm)

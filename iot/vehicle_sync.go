@@ -4,13 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// opConn is the subset of pgx shared by *pgxpool.Pool and pgx.Tx, so the
+// registry status update and its outbox enqueue can run either directly on the
+// pool or together inside one transaction.
+type opConn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // StatusSyncResult is returned when SyncVehicleFromPing updates a registry row.
 type StatusSyncResult struct {
@@ -30,6 +38,10 @@ const (
 // so the existing API surface keeps reflecting the latest known state.
 // Best-effort: vehicle not found yields an empty result without error.
 func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) (StatusSyncResult, error) {
+	return s.syncVehicleFromPing(ctx, s.op(), p)
+}
+
+func (s *Store) syncVehicleFromPing(ctx context.Context, db opConn, p Ping) (StatusSyncResult, error) {
 	speed := 0.0
 	if p.SpeedKmh != nil {
 		speed = *p.SpeedKmh
@@ -60,7 +72,7 @@ func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) (StatusSyncResu
         FROM prev
         LEFT JOIN upd ON TRUE`
 	var prevStatus, newStatus *string
-	err := s.op().QueryRow(ctx, q,
+	err := db.QueryRow(ctx, q,
 		p.VehicleID, p.Lat, p.Lng, p.Heading, p.SpeedKmh, p.FuelLevel, p.Odo, p.TS,
 		speed, movingThresholdKmh,
 	).Scan(&prevStatus, &newStatus)
@@ -83,15 +95,27 @@ func (s *Store) SyncVehicleFromPing(ctx context.Context, p Ping) (StatusSyncResu
 }
 
 // ApplyVehicleHotState syncs registry position/status from a ping and enqueues
-// status-change events. Returns the sync result; logs publish failures.
+// the status-change event in the SAME transaction, so the vehicles update and
+// the fleet_event_outbox row commit atomically — a status change can never be
+// applied to the registry without its outbox event (or vice versa). An enqueue
+// failure rolls the whole update back and surfaces as an error to the caller
+// (treated as a registry-sync failure; pings are already durably persisted).
 func (s *Store) ApplyVehicleHotState(ctx context.Context, p Ping) (StatusSyncResult, error) {
-	syncRes, err := s.SyncVehicleFromPing(ctx, p)
+	tx, err := s.op().Begin(ctx)
 	if err != nil {
 		return StatusSyncResult{}, err
 	}
-	if err := s.PublishStatusChange(ctx, syncRes); err != nil {
-		slog.Warn("fleet status outbox enqueue failed",
-			"vehicleId", p.VehicleID, "err", err)
+	defer tx.Rollback(ctx)
+
+	syncRes, err := s.syncVehicleFromPing(ctx, tx, p)
+	if err != nil {
+		return StatusSyncResult{}, err
+	}
+	if err := s.publishStatusChange(ctx, tx, syncRes); err != nil {
+		return StatusSyncResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return StatusSyncResult{}, err
 	}
 	return syncRes, nil
 }
@@ -142,10 +166,14 @@ func (s *Store) MarkStaleVehiclesOffline(ctx context.Context, cutoff time.Time) 
 // PublishStatusChange enqueues fleet.vehicle.status_changed on the operational
 // outbox when EVENT_BUS_ENABLED=true. Safe no-op when disabled or unchanged.
 func (s *Store) PublishStatusChange(ctx context.Context, result StatusSyncResult) error {
+	return s.publishStatusChange(ctx, s.op(), result)
+}
+
+func (s *Store) publishStatusChange(ctx context.Context, db opConn, result StatusSyncResult) error {
 	if !result.Changed || result.VehicleID == "" {
 		return nil
 	}
-	return s.enqueueFleetEvent(ctx, typeVehicleStatusChanged, result.VehicleID, map[string]any{
+	return s.enqueueFleetEvent(ctx, db, typeVehicleStatusChanged, result.VehicleID, map[string]any{
 		"vehicleId":      result.VehicleID,
 		"status":         result.NewStatus,
 		"previousStatus": result.PreviousStatus,
@@ -156,7 +184,7 @@ func (s *Store) PublishStatusChange(ctx context.Context, result StatusSyncResult
 // PublishStatusChanges batch-enqueues stale-offline transitions.
 func (s *Store) PublishStatusChanges(ctx context.Context, changes []StatusChange) error {
 	for _, ch := range changes {
-		if err := s.enqueueFleetEvent(ctx, typeVehicleStatusChanged, ch.VehicleID, map[string]any{
+		if err := s.enqueueFleetEvent(ctx, s.op(), typeVehicleStatusChanged, ch.VehicleID, map[string]any{
 			"vehicleId":      ch.VehicleID,
 			"status":         ch.NewStatus,
 			"previousStatus": ch.PreviousStatus,
@@ -168,7 +196,7 @@ func (s *Store) PublishStatusChanges(ctx context.Context, changes []StatusChange
 	return nil
 }
 
-func (s *Store) enqueueFleetEvent(ctx context.Context, eventType, key string, data map[string]any) error {
+func (s *Store) enqueueFleetEvent(ctx context.Context, db opConn, eventType, key string, data map[string]any) error {
 	if !eventBusEnabled() {
 		return nil
 	}
@@ -180,7 +208,7 @@ func (s *Store) enqueueFleetEvent(ctx context.Context, eventType, key string, da
 	if key != "" {
 		keyArg = key
 	}
-	_, err = s.op().Exec(ctx, `
+	_, err = db.Exec(ctx, `
 		INSERT INTO fleet_event_outbox (event_type, event_key, payload)
 		VALUES ($1, $2, $3::jsonb)
 	`, eventType, keyArg, body)

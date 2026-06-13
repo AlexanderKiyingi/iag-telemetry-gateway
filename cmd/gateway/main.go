@@ -51,7 +51,7 @@ func main() {
 	}
 	slog.Info("telemetry TCP gateway listening", "addr", addr)
 
-	srv := &tcpGateway{store: store, hub: hub}
+	srv := &tcpGateway{store: store, hub: hub, sem: make(chan struct{}, maxTCPConns)}
 	go srv.serve(listener)
 
 	stop := make(chan os.Signal, 1)
@@ -79,10 +79,16 @@ func configureLogger() {
 	slog.SetDefault(slog.New(h))
 }
 
+// maxTCPConns caps concurrently-handled device connections so an attacker
+// opening many sockets cannot exhaust goroutines/file descriptors. Connections
+// beyond the cap are rejected immediately rather than queued.
+const maxTCPConns = 2048
+
 type tcpGateway struct {
 	store *iot.Store
 	hub   *iot.Hub
 	wg    sync.WaitGroup
+	sem   chan struct{}
 }
 
 func (g *tcpGateway) serve(l net.Listener) {
@@ -95,17 +101,34 @@ func (g *tcpGateway) serve(l net.Listener) {
 			slog.Error("accept failed", "err", err)
 			continue
 		}
-		g.wg.Add(1)
-		go func() {
-			defer g.wg.Done()
-			g.handle(conn)
-		}()
+		select {
+		case g.sem <- struct{}{}:
+			g.wg.Add(1)
+			go func() {
+				defer g.wg.Done()
+				defer func() { <-g.sem }()
+				g.handle(conn)
+			}()
+		default:
+			slog.Warn("tcp gateway at capacity; rejecting connection",
+				"remote", conn.RemoteAddr().String(), "max", maxTCPConns)
+			_ = conn.Close()
+		}
 	}
 }
 
 func (g *tcpGateway) handle(conn net.Conn) {
-	defer conn.Close()
 	remote := conn.RemoteAddr().String()
+	defer conn.Close()
+	// A malformed Teltonika frame that slips past the codec's bounds checks must
+	// not panic the whole process (an unrecovered panic in any goroutine is
+	// fatal in Go). Contain it to this one connection.
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("tcp gateway connection panic recovered", "remote", remote, "panic", rec)
+		}
+	}()
+
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	r := bufio.NewReader(conn)
 	imei, err := iot.ReadHandshake(r)
@@ -113,16 +136,22 @@ func (g *tcpGateway) handle(conn net.Conn) {
 		return
 	}
 	logger := slog.With("remote", remote, "imei", imei)
-	ctx := context.Background()
-	device, err := g.store.FindBySerial(ctx, imei)
+
+	hsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	device, err := g.store.FindBySerial(hsCtx, imei)
 	if err != nil {
+		cancel()
 		_ = iot.WriteHandshakeResponse(conn, false)
 		return
 	}
 	if err := iot.WriteHandshakeResponse(conn, true); err != nil {
+		cancel()
 		return
 	}
-	_ = g.store.MarkSeen(ctx, device.ID, ipOnly(remote))
+	if err := g.store.MarkSeen(hsCtx, device.ID, ipOnly(remote)); err != nil {
+		logger.Warn("mark device seen failed", "err", err)
+	}
+	cancel()
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -134,7 +163,12 @@ func (g *tcpGateway) handle(conn net.Conn) {
 		for _, rec := range records {
 			pings = append(pings, recordToPing(rec, device))
 		}
-		if _, err := g.store.InsertPings(ctx, pings); err != nil {
+
+		// Bound each packet's database work so a slow/hung DB cannot pin the
+		// connection (and its goroutine slot) indefinitely.
+		opCtx, opCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if _, err := g.store.InsertPings(opCtx, pings); err != nil {
+			opCancel()
 			logger.Error("insert pings failed", "err", err)
 			return
 		}
@@ -145,13 +179,19 @@ func (g *tcpGateway) handle(conn net.Conn) {
 					newest = p
 				}
 			}
-			if _, err := g.store.ApplyVehicleHotState(ctx, newest); err != nil {
+			if _, err := g.store.ApplyVehicleHotState(opCtx, newest); err != nil {
 				logger.Warn("registry sync failed after TCP ingest",
 					"vehicleId", device.VehicleID, "err", err)
 			}
-			_ = g.store.ApplyGeofenceTransitions(ctx, iot.ProcessGeofences(newest))
+			if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(newest)); err != nil {
+				logger.Warn("geofence transitions failed after TCP ingest", "err", err)
+			}
 		}
-		_ = g.store.MarkSeen(ctx, device.ID, ipOnly(remote))
+		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
+			logger.Warn("mark device seen failed", "err", err)
+		}
+		opCancel()
+
 		_ = iot.WriteACK(conn, len(records))
 		if g.hub != nil {
 			for _, p := range pings {

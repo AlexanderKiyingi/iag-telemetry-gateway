@@ -61,12 +61,20 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 	now := time.Now().UTC()
 	pings := make([]Ping, 0, len(batch))
 	for _, b := range batch {
-		vehicleID := b.VehicleID
-		if vehicleID == "" {
-			vehicleID = device.VehicleID
-		}
-		if vehicleID == "" {
-			return IngestBatchResult{}, fmt.Errorf("vehicleId required (device has no default binding)")
+		// A device bound to a vehicle may only post telemetry for that vehicle.
+		// Without this, any valid API key could inject pings for arbitrary
+		// vehicleIds it does not own. Unbound devices (no default binding) must
+		// name a vehicleId explicitly.
+		vehicleID := device.VehicleID
+		if device.VehicleID != "" {
+			if b.VehicleID != "" && b.VehicleID != device.VehicleID {
+				return IngestBatchResult{}, fmt.Errorf("vehicleId %q does not match device binding", b.VehicleID)
+			}
+		} else {
+			vehicleID = b.VehicleID
+			if vehicleID == "" {
+				return IngestBatchResult{}, fmt.Errorf("vehicleId required (device has no default binding)")
+			}
 		}
 		if b.Lat < -90 || b.Lat > 90 || b.Lng < -180 || b.Lng > 180 {
 			return IngestBatchResult{}, fmt.Errorf("invalid coordinates")
@@ -106,9 +114,14 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 			result.RegistrySyncFailed = true
 			result.RegistrySyncError = err.Error()
 		}
-		_ = store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest))
+		if err := store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest)); err != nil {
+			slog.Warn("geofence transitions failed after ingest",
+				"vehicleId", newest.VehicleID, "err", err)
+		}
 	}
-	_ = store.MarkSeen(ctx, device.ID, clientIP)
+	if err := store.MarkSeen(ctx, device.ID, clientIP); err != nil {
+		slog.Warn("mark device seen failed", "deviceId", device.ID, "err", err)
+	}
 	if hub != nil {
 		for _, p := range pings {
 			hub.Publish(p)

@@ -84,8 +84,19 @@ func configureLogger() {
 // beyond the cap are rejected immediately rather than queued.
 const maxTCPConns = 2048
 
+// tcpStore is the subset of *iot.Store the connection loop uses. Narrowing it to
+// an interface lets the loop be tested with a fake store (no Postgres). The
+// concrete *iot.Store satisfies it.
+type tcpStore interface {
+	FindBySerial(ctx context.Context, serial string) (*iot.Device, error)
+	MarkSeen(ctx context.Context, deviceID int64, ip string) error
+	InsertPings(ctx context.Context, pings []iot.Ping) (int, error)
+	ApplyVehicleHotState(ctx context.Context, p iot.Ping) (iot.StatusSyncResult, error)
+	ApplyGeofenceTransitions(ctx context.Context, transitions []iot.GeofenceTransition) error
+}
+
 type tcpGateway struct {
-	store *iot.Store
+	store tcpStore
 	hub   *iot.Hub
 	wg    sync.WaitGroup
 	sem   chan struct{}
@@ -152,6 +163,11 @@ func (g *tcpGateway) handle(conn net.Conn) {
 		logger.Warn("mark device seen failed", "err", err)
 	}
 	cancel()
+	// The binding is fixed for the connection's life, so warn once here rather
+	// than per packet (see the unbound-device guard in the loop below).
+	if device.VehicleID == "" {
+		logger.Warn("device has no vehicle binding; positions will be dropped until it is bound to a vehicle")
+	}
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -159,33 +175,61 @@ func (g *tcpGateway) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		pings := make([]iot.Ping, 0, len(records))
-		for _, rec := range records {
-			pings = append(pings, recordToPing(rec, device))
-		}
-
 		// Bound each packet's database work so a slow/hung DB cannot pin the
 		// connection (and its goroutine slot) indefinitely.
 		opCtx, opCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		// An unbound device has nowhere to attach telemetry — telemetry_timeseries
+		// .vehicle_id is NOT NULL and the hot-state/geofence steps are
+		// vehicle-scoped. ACK so the device clears its buffer and keep the link
+		// alive, but never write orphan ''-vehicle pings (warned once at handshake).
+		if device.VehicleID == "" {
+			if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
+				logger.Warn("mark device seen failed", "err", err)
+			}
+			opCancel()
+			_ = iot.WriteACK(conn, len(records))
+			continue
+		}
+
+		// (0,0) is Teltonika's no-GPS-lock sentinel; drop those records so the
+		// track and trip detector aren't polluted with null-island fixes.
+		pings := make([]iot.Ping, 0, len(records))
+		for _, rec := range records {
+			if rec.Latitude == 0 && rec.Longitude == 0 {
+				continue
+			}
+			pings = append(pings, recordToPing(rec, device))
+		}
+		if len(pings) == 0 {
+			// Whole packet was no-fix (e.g. still acquiring lock); ack + refresh
+			// last-seen so the device still shows as reporting.
+			if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
+				logger.Warn("mark device seen failed", "err", err)
+			}
+			opCancel()
+			_ = iot.WriteACK(conn, len(records))
+			logger.Debug("skip no-fix packet", "records", len(records), "codec", codec)
+			continue
+		}
+
 		if _, err := g.store.InsertPings(opCtx, pings); err != nil {
 			opCancel()
 			logger.Error("insert pings failed", "err", err)
 			return
 		}
-		if device.VehicleID != "" && len(pings) > 0 {
-			newest := pings[0]
-			for _, p := range pings[1:] {
-				if p.TS.After(newest.TS) {
-					newest = p
-				}
+		newest := pings[0]
+		for _, p := range pings[1:] {
+			if p.TS.After(newest.TS) {
+				newest = p
 			}
-			if _, err := g.store.ApplyVehicleHotState(opCtx, newest); err != nil {
-				logger.Warn("registry sync failed after TCP ingest",
-					"vehicleId", device.VehicleID, "err", err)
-			}
-			if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(newest)); err != nil {
-				logger.Warn("geofence transitions failed after TCP ingest", "err", err)
-			}
+		}
+		if _, err := g.store.ApplyVehicleHotState(opCtx, newest); err != nil {
+			logger.Warn("registry sync failed after TCP ingest",
+				"vehicleId", device.VehicleID, "err", err)
+		}
+		if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(newest)); err != nil {
+			logger.Warn("geofence transitions failed after TCP ingest", "err", err)
 		}
 		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 			logger.Warn("mark device seen failed", "err", err)
@@ -198,7 +242,7 @@ func (g *tcpGateway) handle(conn net.Conn) {
 				g.hub.Publish(p)
 			}
 		}
-		logger.Info("pings persisted", "count", len(records), "codec", codec)
+		logger.Info("pings persisted", "count", len(pings), "codec", codec)
 	}
 }
 

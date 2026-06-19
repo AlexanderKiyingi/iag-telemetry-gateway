@@ -7,6 +7,7 @@ Fleet telemetry ingest service for the IAG platform. **iag-fleet** owns business
 ```text
 Devices / relays
     ├─ TCP Teltonika (:5027)  → cmd/gateway
+    ├─ TCP SinoTrack/HQ (:5013) → cmd/sinotrack   (ST-901/906/915 + HQ clones)
     └─ HTTP JSON (:4080)      → cmd/ingest
               │
               ▼
@@ -35,6 +36,7 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 |--------|---------|-------------|
 | `/app/ingest` | `:4080` | `POST /v1/pings`, `POST /api/iot/pings` |
 | `/app/gateway` | `:5027` | Teltonika Codec 8/8E TCP |
+| `/app/sinotrack` | `:5013` | SinoTrack / HQ-protocol TCP (ST-901/906/915 + GT06-era clones) |
 
 ## Environment
 
@@ -45,7 +47,23 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 | `EVENT_BUS_ENABLED` | no | When `true`, ingest enqueues `fleet.vehicle.status_changed` to `fleet_event_outbox` on the operational DB |
 | `REDIS_URL` | no | Live SSE fan-out for fleet API replicas |
 | `ADDR` / `PORT` | no | HTTP ingest (default `:4080`) |
-| `IOT_ADDR` | no | TCP gateway (default `:5027`) |
+| `IOT_ADDR` | no | Teltonika TCP gateway (default `:5027`) |
+| `SINOTRACK_ADDR` | no | SinoTrack/HQ TCP gateway (default `:5013`) |
+
+## Smoke-testing SinoTrack without hardware
+
+`cmd/hqreplay` is a dev-only TCP client that feeds HQ frames to a running
+`cmd/sinotrack` gateway. Register a device whose `serial` matches `-id`, then:
+
+```sh
+# synthetic stream that drifts NE around Kampala
+go run ./cmd/hqreplay -addr localhost:5013 -id 9170503816 -count 10
+
+# replay captured frames verbatim (one per line; blank/'#'-prefixed lines skipped)
+go run ./cmd/hqreplay -addr localhost:5013 -file captured-frames.txt
+```
+
+It is **not** part of the Docker build — local tooling only.
 
 ## Monorepo wiring
 

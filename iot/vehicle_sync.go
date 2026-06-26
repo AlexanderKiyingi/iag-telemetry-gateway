@@ -29,9 +29,9 @@ type StatusSyncResult struct {
 }
 
 const (
-	fleetEventSource             = "iag.fleet"
-	fleetEventSpecVersion        = "1.0"
-	typeVehicleStatusChanged     = "fleet.vehicle.status_changed"
+	fleetEventSource         = "iag.fleet"
+	fleetEventSpecVersion    = "1.0"
+	typeVehicleStatusChanged = "fleet.vehicle.status_changed"
 )
 
 // SyncVehicleFromPing pushes a ping's position/speed into the vehicles row
@@ -46,19 +46,26 @@ func (s *Store) syncVehicleFromPing(ctx context.Context, db opConn, p Ping) (Sta
 	if p.SpeedKmh != nil {
 		speed = *p.SpeedKmh
 	}
+	// A ping with no device is a driver-phone (companion app) fix; a bound
+	// device is a hardware tracker. The live map labels the two differently.
+	fixSource := "device"
+	if p.DeviceID == nil {
+		fixSource = "mobile"
+	}
 	const q = `
         WITH prev AS (
             SELECT status FROM vehicles WHERE id = $1
         ),
         upd AS (
             UPDATE vehicles SET
-                lat       = $2,
-                lng       = $3,
-                heading   = COALESCE($4, heading),
-                speed     = COALESCE($5, speed),
-                fuel      = COALESCE($6, fuel),
-                odo       = COALESCE($7, odo),
-                last_seen = $8,
+                lat             = $2,
+                lng             = $3,
+                heading         = COALESCE($4, heading),
+                speed           = COALESCE($5, speed),
+                fuel            = COALESCE($6, fuel),
+                odo             = COALESCE($7, odo),
+                last_seen       = $8,
+                last_fix_source = $11,
                 status    = CASE
                     WHEN vehicles.status = 'maintenance' THEN vehicles.status
                     WHEN $9 >= $10::float8 THEN 'moving'
@@ -74,7 +81,7 @@ func (s *Store) syncVehicleFromPing(ctx context.Context, db opConn, p Ping) (Sta
 	var prevStatus, newStatus *string
 	err := db.QueryRow(ctx, q,
 		p.VehicleID, p.Lat, p.Lng, p.Heading, p.SpeedKmh, p.FuelLevel, p.Odo, p.TS,
-		speed, movingThresholdKmh,
+		speed, movingThresholdKmh, fixSource,
 	).Scan(&prevStatus, &newStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StatusSyncResult{}, nil

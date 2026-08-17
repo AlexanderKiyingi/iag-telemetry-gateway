@@ -205,12 +205,22 @@ func (g *hqGateway) handle(conn net.Conn) {
 		}
 		// A 'V' fix means no GPS lock; coordinates are stale/garbage. Skip the
 		// insert (avoids polluting the track with 0,0) but stay connected.
-		if !msg.ValidFix {
+		//
+		// The validity flag alone is not enough. ParseHQFrame classifies a frame
+		// as a position by its SHAPE, not its type code, so a heartbeat or
+		// command echo that happens to carry a position-shaped payload is
+		// treated as a fix — and HQ-protocol clones routinely emit exactly that
+		// on cold start or indoors: validity 'A' with 0,0 coordinates. Inserted,
+		// it drops the vehicle on Null Island in the Gulf of Guinea, corrupts the
+		// track, and hands trip detection a continent-sized jump. ProcessGeofences
+		// already refuses to evaluate 0,0 for the same reason.
+		if !msg.ValidFix || (msg.Lat == 0 && msg.Lng == 0) {
 			if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 				logger.Warn("mark device seen failed", "err", err)
 			}
 			opCancel()
-			logger.Debug("skip invalid fix", "type", msg.Type)
+			logger.Debug("skip fix without a usable position",
+				"type", msg.Type, "validFix", msg.ValidFix, "lat", msg.Lat, "lng", msg.Lng)
 			continue
 		}
 

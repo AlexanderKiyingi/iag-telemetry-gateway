@@ -102,6 +102,12 @@ const (
 	frameUnbound = "*HQ,9170000002,V1,123506,A,2232.6024,N,11355.7983,E,000.00,000,131216,FFFFFBFF#"
 	frameNoFix   = "*HQ,9170503816,V1,123506,V,0000.0000,N,00000.0000,E,000.00,000,131216,FFFFFBFF#"
 	frameUnknown = "*HQ,9999999999,V1,123506,A,2232.6024,N,11355.7983,E,000.00,000,131216,FFFFFBFF#"
+	// Validity 'A' but 0,0 coordinates. HQ clones emit this on cold start and
+	// indoors, and because ParseHQFrame classifies by frame shape rather than
+	// type code, a heartbeat carrying a position-shaped payload arrives the same
+	// way. Either would land the vehicle on Null Island if inserted.
+	frameZeroCoords    = "*HQ,9170503816,V1,123506,A,0000.0000,N,00000.0000,E,000.00,000,131216,FFFFFBFF#"
+	frameZeroHeartbeat = "*HQ,9170503816,XT,120005,A,0000.0000,N,00000.0000,E,000.00,000,170826,FFFFFBFF#"
 )
 
 func storeWith(devs ...*iot.Device) *fakeStore {
@@ -165,6 +171,33 @@ func TestHandleInvalidFixSkipsInsert(t *testing.T) {
 	}
 	if mark == 0 {
 		t.Fatalf("expected device marked seen on no-fix frame")
+	}
+}
+
+// A frame claiming a valid fix at 0,0 must be treated like a no-fix frame: the
+// link stays warm but nothing is written. Before this guard the validity flag
+// was the only check, so these were inserted and the vehicle jumped to the Gulf
+// of Guinea on the live map.
+func TestHandleZeroCoordinatesSkipInsert(t *testing.T) {
+	for name, frame := range map[string]string{
+		"position frame at 0,0":                 frameZeroCoords,
+		"heartbeat shaped as a position at 0,0": frameZeroHeartbeat,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true})
+			runHandle(t, s, frame)
+
+			insert, hot, mark := s.counts()
+			if insert != 0 {
+				t.Fatalf("0,0 frame must not write pings, got %d", insert)
+			}
+			if hot != 0 {
+				t.Fatalf("0,0 frame must not move vehicle hot-state, got %d", hot)
+			}
+			if mark == 0 {
+				t.Fatalf("expected the device to still be marked seen")
+			}
+		})
 	}
 }
 

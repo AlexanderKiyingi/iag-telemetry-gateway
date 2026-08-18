@@ -137,12 +137,14 @@ func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
 func (s *Store) FindBySerial(ctx context.Context, serial string) (*Device, error) {
 	const q = `
         SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
-               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
+               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at,
+               COALESCE(model,''), COALESCE(protocol,'')
         FROM iot_devices WHERE serial = $1`
 	var d Device
 	err := s.op().QueryRow(ctx, q, serial).Scan(
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
+		&d.Model, &d.Protocol,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceNotFound
@@ -263,6 +265,60 @@ func (s *Store) MarkSeen(ctx context.Context, deviceID int64, ip string) error {
 	_, err := s.op().Exec(ctx,
 		`UPDATE iot_devices SET last_seen = NOW(), last_ip = NULLIF($2, '') WHERE id = $1`,
 		deviceID, ip,
+	)
+	return err
+}
+
+// RecordStatusWord accumulates one distinct (device, frame type, status word)
+// observation.
+//
+// The status/alarm bitfield is the only route to ACC and alarm state on
+// HQ-protocol hardware, and its layout varies by firmware — so it has to be
+// derived by correlating observed words against known physical state rather
+// than read from a datasheet. This is what makes that possible.
+//
+// It is deliberately called for frames the gateway SKIPS as well as ones it
+// ingests. Power-cut and tamper alarms routinely arrive with no usable fix, so
+// the frames carrying the most interesting bits are exactly the ones that never
+// become a ping. Storing only the distinct set (with a count) keeps this bounded
+// by the device's real state space instead of growing per frame.
+func (s *Store) RecordStatusWord(ctx context.Context, deviceID int64, frameType, statusWord, sampleFrame string, hadFix bool) error {
+	if deviceID == 0 || statusWord == "" {
+		return nil
+	}
+	if frameType == "" {
+		frameType = "?"
+	}
+	// Bound the stored sample: a frame is well under 200 bytes, but a garbage
+	// stream should not be able to widen the row.
+	if len(sampleFrame) > 512 {
+		sampleFrame = sampleFrame[:512]
+	}
+	_, err := s.op().Exec(ctx, `
+		INSERT INTO iot_status_observations
+		       (device_id, frame_type, status_word, observations, had_fix, sample_frame)
+		VALUES ($1, $2, $3, 1, $4, $5)
+		ON CONFLICT (device_id, frame_type, status_word) DO UPDATE
+		   SET observations = iot_status_observations.observations + 1,
+		       last_seen    = NOW(),
+		       -- Latch had_fix: one frame with a fix is enough to tell us this
+		       -- word can accompany a position, which is what distinguishes a
+		       -- state bit from an alarm-only frame.
+		       had_fix      = iot_status_observations.had_fix OR EXCLUDED.had_fix
+	`, deviceID, frameType, statusWord, hadFix, sampleFrame)
+	return err
+}
+
+// SetDeviceProtocol records the wire protocol a device was last seen speaking.
+// Cheap to keep current and the fastest way to answer "why is this unit not
+// reporting" — a GT06-firmware tracker dialling the HQ port shows up here.
+func (s *Store) SetDeviceProtocol(ctx context.Context, deviceID int64, protocol string) error {
+	if deviceID == 0 || protocol == "" {
+		return nil
+	}
+	_, err := s.op().Exec(ctx,
+		`UPDATE iot_devices SET protocol = $2 WHERE id = $1 AND protocol IS DISTINCT FROM $2`,
+		deviceID, protocol,
 	)
 	return err
 }
@@ -607,16 +663,16 @@ func (s *Store) FleetFuelAnomalies(ctx context.Context, from, to time.Time, limi
 // by the per-vehicle fuel-summary endpoint to give distance, fuel used,
 // efficiency in km/L, and event counts at a glance.
 type FuelSummary struct {
-	VehicleID       string    `json:"vehicleId"`
-	From            time.Time `json:"from"`
-	To              time.Time `json:"to"`
-	DistanceKm      float64   `json:"distanceKm"`
-	FuelUsedLitres  *float64  `json:"fuelUsedLitres,omitempty"`
-	KmPerLitre      *float64  `json:"kmPerLitre,omitempty"`
-	RefuelCount     int       `json:"refuelCount"`
-	DropCount       int       `json:"dropCount"`
-	RefuelLitres    *float64  `json:"refuelLitres,omitempty"`
-	DropLitres      *float64  `json:"dropLitres,omitempty"`
+	VehicleID      string    `json:"vehicleId"`
+	From           time.Time `json:"from"`
+	To             time.Time `json:"to"`
+	DistanceKm     float64   `json:"distanceKm"`
+	FuelUsedLitres *float64  `json:"fuelUsedLitres,omitempty"`
+	KmPerLitre     *float64  `json:"kmPerLitre,omitempty"`
+	RefuelCount    int       `json:"refuelCount"`
+	DropCount      int       `json:"dropCount"`
+	RefuelLitres   *float64  `json:"refuelLitres,omitempty"`
+	DropLitres     *float64  `json:"dropLitres,omitempty"`
 }
 
 func (s *Store) FuelSummary(ctx context.Context, vehicleID string, from, to time.Time) (*FuelSummary, error) {

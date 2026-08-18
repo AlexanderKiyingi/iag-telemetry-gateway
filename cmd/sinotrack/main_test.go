@@ -13,13 +13,26 @@ import (
 
 // fakeStore records the gateway's calls and mimics FindBySerial's active/known
 // checks, so the connection loop can be exercised without Postgres.
+// statusObs is one RecordStatusWord call, so tests can assert that the status
+// word is captured even for frames the gateway skips.
+type statusObs struct {
+	deviceID  int64
+	frameType string
+	word      string
+	sample    string
+	hadFix    bool
+}
+
 type fakeStore struct {
-	mu       sync.Mutex
-	devices  map[string]*iot.Device // serial -> row
-	inserted []iot.Ping
-	hotState []iot.Ping
-	geofence int
-	markSeen int
+	mu          sync.Mutex
+	devices     map[string]*iot.Device // serial -> row
+	inserted    []iot.Ping
+	hotState    []iot.Ping
+	geofence    int
+	markSeen    int
+	statusWords []statusObs
+	protocol    string
+	overspeed   []iot.Ping
 }
 
 func (f *fakeStore) FindBySerial(_ context.Context, serial string) (*iot.Device, error) {
@@ -63,10 +76,33 @@ func (f *fakeStore) ApplyGeofenceTransitions(_ context.Context, _ []iot.Geofence
 	return nil
 }
 
+func (f *fakeStore) RecordStatusWord(_ context.Context, deviceID int64, frameType, statusWord, sampleFrame string, hadFix bool) error {
+	f.mu.Lock()
+	f.statusWords = append(f.statusWords, statusObs{
+		deviceID: deviceID, frameType: frameType, word: statusWord,
+		sample: sampleFrame, hadFix: hadFix,
+	})
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeStore) SetDeviceProtocol(_ context.Context, _ int64, protocol string) error {
+	f.mu.Lock()
+	f.protocol = protocol
+	f.mu.Unlock()
+	return nil
+}
+
 func (f *fakeStore) counts() (insert, hot, mark int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.inserted), len(f.hotState), f.markSeen
+}
+
+func (f *fakeStore) status() []statusObs {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]statusObs(nil), f.statusWords...)
 }
 
 // runHandle feeds frames through one gateway connection and returns once the
@@ -201,6 +237,66 @@ func TestHandleZeroCoordinatesSkipInsert(t *testing.T) {
 	}
 }
 
+// The status/alarm word must be captured for frames the gateway SKIPS, not just
+// ones it ingests. Power-cut and tamper alarms arrive without a GPS lock, so if
+// capture were tied to a successful ping insert, the frames carrying the most
+// useful bits would be exactly the ones lost — and the per-model bit layout
+// could never be derived from a pilot.
+func TestHandleRecordsStatusWordOnSkippedFrames(t *testing.T) {
+	cases := []struct {
+		name      string
+		frame     string
+		wantType  string
+		wantFix   bool
+		wantPings int
+	}{
+		{"no-fix frame", frameNoFix, "V1", false, 0},
+		{"zero-coordinate frame", frameZeroCoords, "V1", false, 0},
+		{"heartbeat shaped as a position", frameZeroHeartbeat, "XT", false, 0},
+		{"ingested frame still records", frameBound, "V1", true, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true})
+			runHandle(t, s, tc.frame)
+
+			obs := s.status()
+			if len(obs) != 1 {
+				t.Fatalf("expected exactly 1 status observation, got %d", len(obs))
+			}
+			if obs[0].word != "FFFFFBFF" {
+				t.Errorf("status word = %q, want FFFFFBFF", obs[0].word)
+			}
+			if obs[0].frameType != tc.wantType {
+				t.Errorf("frame type = %q, want %q", obs[0].frameType, tc.wantType)
+			}
+			// hadFix distinguishes a state bit that accompanies a position from
+			// an alarm-only frame — the key signal when correlating the bitfield.
+			if obs[0].hadFix != tc.wantFix {
+				t.Errorf("hadFix = %v, want %v", obs[0].hadFix, tc.wantFix)
+			}
+			if obs[0].sample == "" {
+				t.Error("expected a sample frame kept for offline decoding")
+			}
+			if insert, _, _ := s.counts(); insert != tc.wantPings {
+				t.Errorf("pings inserted = %d, want %d", insert, tc.wantPings)
+			}
+		})
+	}
+}
+
+func TestHandleRecordsProtocolOnConnect(t *testing.T) {
+	s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true})
+	runHandle(t, s, frameBound)
+
+	s.mu.Lock()
+	got := s.protocol
+	s.mu.Unlock()
+	if got != iot.ProtocolHQ {
+		t.Fatalf("device protocol = %q, want %q", got, iot.ProtocolHQ)
+	}
+}
+
 func TestHandleUnknownDeviceClosesWithoutIngest(t *testing.T) {
 	s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true})
 	runHandle(t, s, frameUnknown)
@@ -251,4 +347,11 @@ func TestMessageToPingMapsFields(t *testing.T) {
 	if len(p.Raw) == 0 {
 		t.Errorf("expected raw HQ extras to be preserved")
 	}
+}
+
+func (f *fakeStore) ApplyOverspeed(_ context.Context, p iot.Ping, _ iot.OverspeedConfig) error {
+	f.mu.Lock()
+	f.overspeed = append(f.overspeed, p)
+	f.mu.Unlock()
+	return nil
 }

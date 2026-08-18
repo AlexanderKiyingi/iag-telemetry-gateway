@@ -19,16 +19,33 @@ import (
 )
 
 type Device struct {
-	ID         int64      `json:"id"`
-	Serial     string     `json:"serial"`
-	Label      string     `json:"label,omitempty"`
-	VehicleID  string     `json:"vehicleId,omitempty"`
-	HasAPIKey  bool       `json:"hasApiKey"`
-	IsActive   bool       `json:"isActive"`
-	LastSeen   *time.Time `json:"lastSeen,omitempty"`
-	LastIP     string     `json:"lastIp,omitempty"`
-	CreatedAt  time.Time  `json:"createdAt"`
+	ID        int64      `json:"id"`
+	Serial    string     `json:"serial"`
+	Label     string     `json:"label,omitempty"`
+	VehicleID string     `json:"vehicleId,omitempty"`
+	HasAPIKey bool       `json:"hasApiKey"`
+	IsActive  bool       `json:"isActive"`
+	LastSeen  *time.Time `json:"lastSeen,omitempty"`
+	LastIP    string     `json:"lastIp,omitempty"`
+	CreatedAt time.Time  `json:"createdAt"`
+	// Model keys the status-word bit map — the HQ alarm/ACC layout differs
+	// across SinoTrack firmwares and clones. Empty means unknown, and the word
+	// is stored raw rather than decoded, because a wrong map is worse than none.
+	Model string `json:"model,omitempty"`
+	// Protocol is the wire protocol last seen from this device. Set on connect,
+	// so a unit dialling the wrong gateway is visible without reading logs.
+	Protocol string `json:"protocol,omitempty"`
 }
+
+// Wire protocols a device may speak. SinoTrack ships both HQ-protocol and
+// GT06-protocol firmware depending on model and revision, which is why the
+// listener sniffs rather than assumes.
+const (
+	ProtocolHQ        = "hq"
+	ProtocolGT06      = "gt06"
+	ProtocolTeltonika = "teltonika"
+	ProtocolHTTP      = "http"
+)
 
 // Ping is one position record, persisted to telemetry_timeseries (Timescale hypertable).
 // Lat/Lng are required; everything else is best-effort and may be nil
@@ -55,20 +72,20 @@ type Ping struct {
 // fuel_events. delta_pct is positive for refuels, negative for drops;
 // delta_litres is set only when the vehicle's tank_capacity_litres is known.
 type FuelEvent struct {
-	ID          int64     `json:"id,omitempty"`
-	VehicleID   string    `json:"vehicleId"`
-	Kind        string    `json:"kind"` // refuel | drop
-	TS          time.Time `json:"ts"`
-	DeltaPct    float64   `json:"deltaPct"`
-	DeltaLitres *float64  `json:"deltaLitres,omitempty"`
-	BeforePct   float64   `json:"beforePct"`
-	AfterPct    float64   `json:"afterPct"`
-	Odo         *float64  `json:"odo,omitempty"`
-	SpeedKmh    *float64  `json:"speedKmh,omitempty"`
-	Ignition    *bool     `json:"ignition,omitempty"`
-	Confidence    string    `json:"confidence"` // high | medium | low
-	Notes         string    `json:"notes,omitempty"`
-	FuelRecordID  string    `json:"fuelRecordId,omitempty"`
+	ID           int64     `json:"id,omitempty"`
+	VehicleID    string    `json:"vehicleId"`
+	Kind         string    `json:"kind"` // refuel | drop
+	TS           time.Time `json:"ts"`
+	DeltaPct     float64   `json:"deltaPct"`
+	DeltaLitres  *float64  `json:"deltaLitres,omitempty"`
+	BeforePct    float64   `json:"beforePct"`
+	AfterPct     float64   `json:"afterPct"`
+	Odo          *float64  `json:"odo,omitempty"`
+	SpeedKmh     *float64  `json:"speedKmh,omitempty"`
+	Ignition     *bool     `json:"ignition,omitempty"`
+	Confidence   string    `json:"confidence"` // high | medium | low
+	Notes        string    `json:"notes,omitempty"`
+	FuelRecordID string    `json:"fuelRecordId,omitempty"`
 }
 
 // DailyResult bundles what AggregateDay produces: the summary row plus any
@@ -80,15 +97,15 @@ type DailyResult struct {
 
 // DailySummary is one row of telemetry_daily.
 type DailySummary struct {
-	VehicleID       string    `json:"vehicleId"`
-	Day             time.Time `json:"day"`
-	PingCount       int       `json:"pingCount"`
-	DistanceKm      float64   `json:"distanceKm"`
-	MaxSpeedKmh     *float64  `json:"maxSpeedKmh,omitempty"`
-	AvgSpeedKmh     *float64  `json:"avgSpeedKmh,omitempty"`
-	FuelUsedLitres  *float64  `json:"fuelUsedLitres,omitempty"`
-	MovingMinutes   int       `json:"movingMinutes"`
-	IdleMinutes     int       `json:"idleMinutes"`
-	FirstPing       *time.Time `json:"firstPing,omitempty"`
-	LastPing        *time.Time `json:"lastPing,omitempty"`
+	VehicleID      string     `json:"vehicleId"`
+	Day            time.Time  `json:"day"`
+	PingCount      int        `json:"pingCount"`
+	DistanceKm     float64    `json:"distanceKm"`
+	MaxSpeedKmh    *float64   `json:"maxSpeedKmh,omitempty"`
+	AvgSpeedKmh    *float64   `json:"avgSpeedKmh,omitempty"`
+	FuelUsedLitres *float64   `json:"fuelUsedLitres,omitempty"`
+	MovingMinutes  int        `json:"movingMinutes"`
+	IdleMinutes    int        `json:"idleMinutes"`
+	FirstPing      *time.Time `json:"firstPing,omitempty"`
+	LastPing       *time.Time `json:"lastPing,omitempty"`
 }

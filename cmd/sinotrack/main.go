@@ -59,7 +59,12 @@ func main() {
 	}
 	slog.Info("sinotrack TCP gateway listening", "addr", addr, "protocol", "HQ")
 
-	srv := &hqGateway{store: store, hub: hub, sem: make(chan struct{}, maxTCPConns)}
+	overspeed := iot.OverspeedConfigFromEnv()
+	if overspeed.Enabled() {
+		slog.Info("overspeed monitoring on",
+			"defaultLimitKmh", overspeed.DefaultLimitKmh, "sustain", overspeed.MinBreachDuration)
+	}
+	srv := &hqGateway{store: store, hub: hub, overspeed: overspeed, sem: make(chan struct{}, maxTCPConns)}
 	go srv.serve(listener)
 
 	stop := make(chan os.Signal, 1)
@@ -101,13 +106,17 @@ type hqStore interface {
 	InsertPings(ctx context.Context, pings []iot.Ping) (int, error)
 	ApplyVehicleHotState(ctx context.Context, p iot.Ping) (iot.StatusSyncResult, error)
 	ApplyGeofenceTransitions(ctx context.Context, transitions []iot.GeofenceTransition) error
+	RecordStatusWord(ctx context.Context, deviceID int64, frameType, statusWord, sampleFrame string, hadFix bool) error
+	SetDeviceProtocol(ctx context.Context, deviceID int64, protocol string) error
+	ApplyOverspeed(ctx context.Context, p iot.Ping, cfg iot.OverspeedConfig) error
 }
 
 type hqGateway struct {
-	store hqStore
-	hub   *iot.Hub
-	wg    sync.WaitGroup
-	sem   chan struct{}
+	store     hqStore
+	hub       *iot.Hub
+	overspeed iot.OverspeedConfig
+	wg        sync.WaitGroup
+	sem       chan struct{}
 }
 
 func (g *hqGateway) serve(l net.Listener) {
@@ -180,7 +189,14 @@ func (g *hqGateway) handle(conn net.Conn) {
 			}
 			boundID = msg.DeviceID
 			logger = logger.With("deviceId", boundID, "vehicleId", device.VehicleID)
-			logger.Info("sinotrack device connected")
+			logger.Info("sinotrack device connected", "model", device.Model)
+			// Record the wire protocol so "why isn't this unit reporting" can be
+			// answered from the device row rather than by reading gateway logs.
+			psCtx, psCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := g.store.SetDeviceProtocol(psCtx, device.ID, iot.ProtocolHQ); err != nil {
+				logger.Warn("record device protocol failed", "err", err)
+			}
+			psCancel()
 			// The binding is fixed for the connection's life, so warn once here
 			// rather than per frame.
 			if device.VehicleID == "" {
@@ -193,6 +209,25 @@ func (g *hqGateway) handle(conn net.Conn) {
 		}
 
 		opCtx, opCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		// Capture the status/alarm word on EVERY frame — before any of the skip
+		// branches below, deliberately. It only reaches telemetry_timeseries via
+		// a ping's raw payload, so heartbeats, no-fix frames and 0,0 frames would
+		// otherwise drop theirs; and those are precisely the frames that carry
+		// power-cut and tamper alarms, which arrive without a GPS lock. Without
+		// this a pilot can run for weeks and still not have the data needed to
+		// derive the per-model bit layout.
+		// One definition of "this frame carries a position we can actually use",
+		// shared by the capture below and the skip branch further down, so the two
+		// can never disagree about what counts as a fix.
+		usablePosition := msg.IsPosition && msg.ValidFix && !(msg.Lat == 0 && msg.Lng == 0)
+
+		if msg.Status != "" {
+			if err := g.store.RecordStatusWord(opCtx, device.ID, msg.Type, msg.Status, msg.Raw,
+				usablePosition); err != nil {
+				logger.Warn("record status word failed", "err", err)
+			}
+		}
 
 		// Non-position frames (heartbeat / login / command echo) keep the link
 		// alive and refresh last-seen, but produce no ping.
@@ -214,7 +249,7 @@ func (g *hqGateway) handle(conn net.Conn) {
 		// it drops the vehicle on Null Island in the Gulf of Guinea, corrupts the
 		// track, and hands trip detection a continent-sized jump. ProcessGeofences
 		// already refuses to evaluate 0,0 for the same reason.
-		if !msg.ValidFix || (msg.Lat == 0 && msg.Lng == 0) {
+		if !usablePosition {
 			if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 				logger.Warn("mark device seen failed", "err", err)
 			}
@@ -248,6 +283,12 @@ func (g *hqGateway) handle(conn net.Conn) {
 		}
 		if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(ping)); err != nil {
 			logger.Warn("geofence transitions failed after sinotrack ingest", "err", err)
+		}
+		// Overspeed is evaluated server-side from the same fix rather than
+		// trusting the tracker's own alarm, which is set per unit over SMS and
+		// invisible here. No-op unless a limit is configured.
+		if err := g.store.ApplyOverspeed(opCtx, ping, g.overspeed); err != nil {
+			logger.Warn("overspeed evaluation failed after sinotrack ingest", "err", err)
 		}
 		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 			logger.Warn("mark device seen failed", "err", err)

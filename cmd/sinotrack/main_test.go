@@ -24,15 +24,19 @@ type statusObs struct {
 }
 
 type fakeStore struct {
-	mu          sync.Mutex
-	devices     map[string]*iot.Device // serial -> row
-	inserted    []iot.Ping
-	hotState    []iot.Ping
-	geofence    int
-	markSeen    int
-	statusWords []statusObs
-	protocol    string
-	overspeed   []iot.Ping
+	mu             sync.Mutex
+	devices        map[string]*iot.Device // serial -> row
+	inserted       []iot.Ping
+	hotState       []iot.Ping
+	geofence       int
+	markSeen       int
+	statusWords    []statusObs
+	protocol       string
+	overspeed      []iot.Ping
+	pending        *iot.DeviceCommand
+	snapshot       iot.VehicleSnapshot
+	sentCommands   []string
+	refusedReasons []string
 }
 
 func (f *fakeStore) FindBySerial(_ context.Context, serial string) (*iot.Device, error) {
@@ -354,4 +358,105 @@ func (f *fakeStore) ApplyOverspeed(_ context.Context, p iot.Ping, _ iot.Overspee
 	f.overspeed = append(f.overspeed, p)
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeStore) NextPendingCommand(_ context.Context, _ int64) (*iot.DeviceCommand, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pending, nil
+}
+
+func (f *fakeStore) VehicleSnapshotFor(_ context.Context, _ string) (iot.VehicleSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshot, nil
+}
+
+func (f *fakeStore) MarkCommandSent(_ context.Context, id int64, payload string, _ iot.VehicleSnapshot) error {
+	f.mu.Lock()
+	f.sentCommands = append(f.sentCommands, payload)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeStore) MarkCommandRefused(_ context.Context, id int64, reason string, _ iot.VehicleSnapshot) error {
+	f.mu.Lock()
+	f.refusedReasons = append(f.refusedReasons, reason)
+	f.mu.Unlock()
+	return nil
+}
+
+// Enabling commands is not enough to send one: without a verified per-model
+// encoder the gateway must refuse. This is the guard that stops a guessed byte
+// sequence ever reaching a relay.
+func TestDeliverCommand_refusesWithoutVerifiedEncoder(t *testing.T) {
+	s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true, Model: "ST-UNVERIFIED"})
+	s.pending = &iot.DeviceCommand{
+		ID: 7, DeviceID: 1, VehicleID: "VEH-001", Kind: iot.CommandImmobilize,
+		Status: iot.CommandPending, RequestedAt: time.Now(),
+	}
+	zero := 0.0
+	s.snapshot = iot.VehicleSnapshot{SpeedKmh: &zero, FixAge: time.Second, HasFix: true}
+
+	srv, cli := net.Pipe()
+	g := &hqGateway{store: s, sem: make(chan struct{}, 1),
+		interlock: iot.DefaultInterlockConfig(), commandsEnabled: true}
+	done := make(chan struct{})
+	go func() { g.handle(srv); close(done) }()
+	_, _ = io.WriteString(cli, frameBound)
+	_ = cli.Close()
+	<-done
+
+	s.mu.Lock()
+	sent, refused := len(s.sentCommands), append([]string(nil), s.refusedReasons...)
+	s.mu.Unlock()
+
+	if sent != 0 {
+		t.Fatalf("nothing may be sent without a verified encoder, got %d writes", sent)
+	}
+	if len(refused) != 1 {
+		t.Fatalf("expected exactly one recorded refusal, got %d", len(refused))
+	}
+}
+
+// A moving vehicle must be refused even when everything else is in place.
+func TestDeliverCommand_refusesMovingVehicle(t *testing.T) {
+	iot.RegisterCommandEncoder("ST-MOVETEST", func(string) ([]byte, error) { return []byte("CUT"), nil })
+
+	s := storeWith(&iot.Device{ID: 1, Serial: "9170503816", VehicleID: "VEH-001", IsActive: true, Model: "ST-MOVETEST"})
+	s.pending = &iot.DeviceCommand{
+		ID: 8, DeviceID: 1, VehicleID: "VEH-001", Kind: iot.CommandImmobilize,
+		Status: iot.CommandPending, RequestedAt: time.Now(),
+	}
+	fast := 72.0
+	s.snapshot = iot.VehicleSnapshot{SpeedKmh: &fast, FixAge: time.Second, HasFix: true}
+
+	srv, cli := net.Pipe()
+	g := &hqGateway{store: s, sem: make(chan struct{}, 1),
+		interlock: iot.DefaultInterlockConfig(), commandsEnabled: true}
+	done := make(chan struct{})
+	go func() { g.handle(srv); close(done) }()
+	_, _ = io.WriteString(cli, frameBound)
+	_ = cli.Close()
+	<-done
+
+	s.mu.Lock()
+	sent, refused := len(s.sentCommands), append([]string(nil), s.refusedReasons...)
+	s.mu.Unlock()
+
+	if sent != 0 {
+		t.Fatal("must not immobilise a vehicle doing 72 km/h")
+	}
+	if len(refused) != 1 || !contains(refused[0], "moving") {
+		t.Fatalf("expected a refusal mentioning movement, got %v", refused)
+	}
+}
+
+func contains(h, n string) bool {
+	for i := 0; i+len(n) <= len(h); i++ {
+		if h[i:i+len(n)] == n {
+			return true
+		}
+	}
+	return false
 }

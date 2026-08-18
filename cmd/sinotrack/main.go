@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -59,12 +60,36 @@ func main() {
 	}
 	slog.Info("sinotrack TCP gateway listening", "addr", addr, "protocol", "HQ")
 
+	// Load geofences from the database, then keep them fresh. A failure here is
+	// deliberately non-fatal: the built-in defaults still apply, and refusing to
+	// start a telemetry gateway because a POI table was unreachable would trade
+	// a stale geofence for total blindness.
+	geoCtx, geoCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := store.RefreshGeofencePOIs(geoCtx); err != nil {
+		slog.Warn("geofence POIs: using built-in defaults", "err", err)
+	} else {
+		slog.Info("geofence POIs loaded", "count", len(iot.ActiveGeofencePOIs()))
+	}
+	geoCancel()
+	go refreshGeofencesPeriodically(store)
+
 	overspeed := iot.OverspeedConfigFromEnv()
 	if overspeed.Enabled() {
 		slog.Info("overspeed monitoring on",
 			"defaultLimitKmh", overspeed.DefaultLimitKmh, "sustain", overspeed.MinBreachDuration)
 	}
-	srv := &hqGateway{store: store, hub: hub, overspeed: overspeed, sem: make(chan struct{}, maxTCPConns)}
+	// Remote immobilisation is opt-in and stays unavailable until a verified
+	// per-model encoder is registered, so enabling the flag alone cannot send
+	// anything to a device.
+	commandsEnabled := strings.EqualFold(os.Getenv("FLEET_DEVICE_COMMANDS_ENABLED"), "true")
+	if commandsEnabled {
+		slog.Info("device commands enabled", "modelsWithVerifiedEncoder", iot.SupportedCommandModels())
+	}
+	srv := &hqGateway{
+		store: store, hub: hub, overspeed: overspeed,
+		interlock: iot.DefaultInterlockConfig(), commandsEnabled: commandsEnabled,
+		sem: make(chan struct{}, maxTCPConns),
+	}
 	go srv.serve(listener)
 
 	stop := make(chan os.Signal, 1)
@@ -97,6 +122,25 @@ func configureLogger() {
 // beyond the cap are rejected immediately rather than queued.
 const maxTCPConns = 2048
 
+// geofenceRefreshInterval is how often the POI set is reloaded. Geofences are
+// edited by hand and rarely, so this only needs to be short enough that a change
+// takes effect within a shift — not short enough to matter as query load.
+const geofenceRefreshInterval = 5 * time.Minute
+
+func refreshGeofencesPeriodically(store *iot.Store) {
+	t := time.NewTicker(geofenceRefreshInterval)
+	defer t.Stop()
+	for range t.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := store.RefreshGeofencePOIs(ctx); err != nil {
+			// Keep the previous set; a transient database blip must not turn
+			// geofencing off.
+			slog.Warn("geofence POI refresh failed, keeping previous set", "err", err)
+		}
+		cancel()
+	}
+}
+
 // hqStore is the subset of *iot.Store the connection loop uses. Narrowing it to
 // an interface lets the loop be tested with a fake store (no Postgres). The
 // concrete *iot.Store satisfies it.
@@ -109,14 +153,85 @@ type hqStore interface {
 	RecordStatusWord(ctx context.Context, deviceID int64, frameType, statusWord, sampleFrame string, hadFix bool) error
 	SetDeviceProtocol(ctx context.Context, deviceID int64, protocol string) error
 	ApplyOverspeed(ctx context.Context, p iot.Ping, cfg iot.OverspeedConfig) error
+	NextPendingCommand(ctx context.Context, deviceID int64) (*iot.DeviceCommand, error)
+	VehicleSnapshotFor(ctx context.Context, vehicleID string) (iot.VehicleSnapshot, error)
+	MarkCommandSent(ctx context.Context, id int64, payload string, snap iot.VehicleSnapshot) error
+	MarkCommandRefused(ctx context.Context, id int64, reason string, snap iot.VehicleSnapshot) error
+}
+
+// deliverPendingCommand checks for a queued command and, if the interlocks
+// allow, writes it to the device's own socket.
+//
+// Delivery is attempted while the device is connected and talking, which is the
+// only moment it can be reached — HQ devices dial out and there is no way to
+// call them. Crucially the interlock runs HERE, against the vehicle state right
+// now, not when the operator pressed the button: a command can sit queued while
+// the truck pulls onto a highway.
+//
+// Every outcome is recorded, refusals included.
+func (g *hqGateway) deliverPendingCommand(ctx context.Context, conn net.Conn, device *iot.Device, logger *slog.Logger) {
+	if !g.commandsEnabled {
+		return
+	}
+	cmd, err := g.store.NextPendingCommand(ctx, device.ID)
+	if err != nil {
+		logger.Warn("check pending command failed", "err", err)
+		return
+	}
+	if cmd == nil {
+		return
+	}
+
+	snap, err := g.store.VehicleSnapshotFor(ctx, cmd.VehicleID)
+	if err != nil {
+		logger.Warn("vehicle snapshot for interlock failed", "err", err)
+		return // leave pending; refusing on a database blip would be wrong
+	}
+
+	verdict := iot.EvaluateInterlock(cmd.Kind, time.Since(cmd.RequestedAt), snap, g.interlock)
+	if !verdict.Allowed {
+		logger.Warn("command refused by interlock",
+			"commandId", cmd.ID, "kind", cmd.Kind, "reason", verdict.Reason)
+		if err := g.store.MarkCommandRefused(ctx, cmd.ID, verdict.Reason, snap); err != nil {
+			logger.Warn("record command refusal failed", "err", err)
+		}
+		return
+	}
+
+	// The model must have a verified encoder. There is no default: an
+	// unrecognised model is refused rather than sent a guessed byte sequence.
+	payload, err := iot.EncodeCommand(device.Model, cmd.Kind)
+	if err != nil {
+		logger.Warn("command refused: no verified encoder",
+			"commandId", cmd.ID, "model", device.Model, "err", err)
+		if err := g.store.MarkCommandRefused(ctx, cmd.ID, err.Error(), snap); err != nil {
+			logger.Warn("record command refusal failed", "err", err)
+		}
+		return
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		logger.Error("command write failed", "commandId", cmd.ID, "err", err)
+		return // stays pending; the device will reconnect
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	logger.Info("command delivered",
+		"commandId", cmd.ID, "kind", cmd.Kind, "reason", verdict.Reason)
+	if err := g.store.MarkCommandSent(ctx, cmd.ID, string(payload), snap); err != nil {
+		logger.Warn("record command sent failed", "err", err)
+	}
 }
 
 type hqGateway struct {
-	store     hqStore
-	hub       *iot.Hub
-	overspeed iot.OverspeedConfig
-	wg        sync.WaitGroup
-	sem       chan struct{}
+	store           hqStore
+	hub             *iot.Hub
+	overspeed       iot.OverspeedConfig
+	interlock       iot.InterlockConfig
+	commandsEnabled bool
+	wg              sync.WaitGroup
+	sem             chan struct{}
 }
 
 func (g *hqGateway) serve(l net.Listener) {
@@ -293,6 +408,9 @@ func (g *hqGateway) handle(conn net.Conn) {
 		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 			logger.Warn("mark device seen failed", "err", err)
 		}
+		// The device is connected and listening right now — the only moment a
+		// queued command can reach it.
+		g.deliverPendingCommand(opCtx, conn, device, logger)
 		opCancel()
 
 		if g.hub != nil {

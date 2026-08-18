@@ -27,7 +27,7 @@ func ProcessGeofences(p Ping) []GeofenceTransition {
 		return nil
 	}
 	var out []GeofenceTransition
-	for _, poi := range GeofencePOIs {
+	for _, poi := range ActiveGeofencePOIs() {
 		inside := InsideGeofence(p.Lat, p.Lng, poi.Lat, poi.Lng, poi.RadiusKm)
 		out = append(out, GeofenceTransition{POIName: poi.Name, Entered: inside, Ping: p})
 	}

@@ -143,7 +143,8 @@ func crc16IBM(data []byte) uint16 {
 func runHandle(t *testing.T, store tcpStore, frames ...[]byte) {
 	t.Helper()
 	srv, cli := net.Pipe()
-	g := &tcpGateway{store: store, sem: make(chan struct{}, 1)}
+	g := &tcpGateway{store: store, sem: make(chan struct{}, 1),
+		pipeline: &iot.Pipeline{Store: store}}
 
 	done := make(chan struct{})
 	go func() {

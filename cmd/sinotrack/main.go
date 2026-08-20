@@ -86,8 +86,12 @@ func main() {
 		slog.Info("device commands enabled", "modelsWithVerifiedEncoder", iot.SupportedCommandModels())
 	}
 	srv := &hqGateway{
-		store: store, hub: hub, overspeed: overspeed,
-		interlock: iot.DefaultInterlockConfig(), commandsEnabled: commandsEnabled,
+		store: store,
+		pipeline: &iot.Pipeline{
+			Store: store, Hub: hub, Overspeed: overspeed,
+			Commands: store, Interlock: iot.DefaultInterlockConfig(),
+			CommandsEnabled: commandsEnabled,
+		},
 		sem: make(chan struct{}, maxTCPConns),
 	}
 	go srv.serve(listener)
@@ -140,79 +144,11 @@ type hqStore interface {
 	MarkCommandRefused(ctx context.Context, id int64, reason string, snap iot.VehicleSnapshot) error
 }
 
-// deliverPendingCommand checks for a queued command and, if the interlocks
-// allow, writes it to the device's own socket.
-//
-// Delivery is attempted while the device is connected and talking, which is the
-// only moment it can be reached — HQ devices dial out and there is no way to
-// call them. Crucially the interlock runs HERE, against the vehicle state right
-// now, not when the operator pressed the button: a command can sit queued while
-// the truck pulls onto a highway.
-//
-// Every outcome is recorded, refusals included.
-func (g *hqGateway) deliverPendingCommand(ctx context.Context, conn net.Conn, device *iot.Device, logger *slog.Logger) {
-	if !g.commandsEnabled {
-		return
-	}
-	cmd, err := g.store.NextPendingCommand(ctx, device.ID)
-	if err != nil {
-		logger.Warn("check pending command failed", "err", err)
-		return
-	}
-	if cmd == nil {
-		return
-	}
-
-	snap, err := g.store.VehicleSnapshotFor(ctx, cmd.VehicleID)
-	if err != nil {
-		logger.Warn("vehicle snapshot for interlock failed", "err", err)
-		return // leave pending; refusing on a database blip would be wrong
-	}
-
-	verdict := iot.EvaluateInterlock(cmd.Kind, time.Since(cmd.RequestedAt), snap, g.interlock)
-	if !verdict.Allowed {
-		logger.Warn("command refused by interlock",
-			"commandId", cmd.ID, "kind", cmd.Kind, "reason", verdict.Reason)
-		if err := g.store.MarkCommandRefused(ctx, cmd.ID, verdict.Reason, snap); err != nil {
-			logger.Warn("record command refusal failed", "err", err)
-		}
-		return
-	}
-
-	// The model must have a verified encoder. There is no default: an
-	// unrecognised model is refused rather than sent a guessed byte sequence.
-	payload, err := iot.EncodeCommand(device.Model, cmd.Kind)
-	if err != nil {
-		logger.Warn("command refused: no verified encoder",
-			"commandId", cmd.ID, "model", device.Model, "err", err)
-		if err := g.store.MarkCommandRefused(ctx, cmd.ID, err.Error(), snap); err != nil {
-			logger.Warn("record command refusal failed", "err", err)
-		}
-		return
-	}
-
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if _, err := conn.Write(payload); err != nil {
-		logger.Error("command write failed", "commandId", cmd.ID, "err", err)
-		return // stays pending; the device will reconnect
-	}
-	_ = conn.SetWriteDeadline(time.Time{})
-
-	logger.Info("command delivered",
-		"commandId", cmd.ID, "kind", cmd.Kind, "reason", verdict.Reason)
-	if err := g.store.MarkCommandSent(ctx, cmd.ID, string(payload), snap); err != nil {
-		logger.Warn("record command sent failed", "err", err)
-	}
-}
-
 type hqGateway struct {
-	store           hqStore
-	hub             *iot.Hub
-	overspeed       iot.OverspeedConfig
-	interlock       iot.InterlockConfig
-	commandsEnabled bool
-	wg              sync.WaitGroup
-	sem             chan struct{}
+	store    hqStore
+	pipeline *iot.Pipeline
+	wg       sync.WaitGroup
+	sem      chan struct{}
 }
 
 func (g *hqGateway) serve(l net.Listener) {
@@ -368,35 +304,19 @@ func (g *hqGateway) handle(conn net.Conn) {
 			continue
 		}
 
+		// Everything past decoding is protocol-independent and lives in the
+		// shared pipeline, so this gateway and the Teltonika one cannot drift.
 		ping := messageToPing(msg, device)
-		if _, err := g.store.InsertPings(opCtx, []iot.Ping{ping}); err != nil {
+		if _, err := g.pipeline.Ingest(opCtx, device, []iot.Ping{ping}, ipOnly(remote), logger); err != nil {
 			opCancel()
 			logger.Error("insert ping failed", "err", err)
 			return
 		}
-		if _, err := g.store.ApplyVehicleHotState(opCtx, ping); err != nil {
-			logger.Warn("registry sync failed after sinotrack ingest", "err", err)
-		}
-		if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(ping)); err != nil {
-			logger.Warn("geofence transitions failed after sinotrack ingest", "err", err)
-		}
-		// Overspeed is evaluated server-side from the same fix rather than
-		// trusting the tracker's own alarm, which is set per unit over SMS and
-		// invisible here. No-op unless a limit is configured.
-		if err := g.store.ApplyOverspeed(opCtx, ping, g.overspeed); err != nil {
-			logger.Warn("overspeed evaluation failed after sinotrack ingest", "err", err)
-		}
-		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
-			logger.Warn("mark device seen failed", "err", err)
-		}
 		// The device is connected and listening right now — the only moment a
 		// queued command can reach it.
-		g.deliverPendingCommand(opCtx, conn, device, logger)
+		g.pipeline.DeliverPendingCommand(opCtx, conn, device, logger)
 		opCancel()
 
-		if g.hub != nil {
-			g.hub.Publish(ping)
-		}
 		logger.Info("ping persisted", "type", msg.Type, "lat", ping.Lat, "lng", ping.Lng)
 	}
 	if err := sc.Err(); err != nil && !errors.Is(err, net.ErrClosed) {

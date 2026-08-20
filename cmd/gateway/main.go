@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -70,7 +71,19 @@ func main() {
 			"defaultLimitKmh", overspeed.DefaultLimitKmh, "sustain", overspeed.MinBreachDuration)
 	}
 
-	srv := &tcpGateway{store: store, hub: hub, overspeed: overspeed, sem: make(chan struct{}, maxTCPConns)}
+	commandsEnabled := strings.EqualFold(os.Getenv("FLEET_DEVICE_COMMANDS_ENABLED"), "true")
+	if commandsEnabled {
+		slog.Info("device commands enabled", "modelsWithVerifiedEncoder", iot.SupportedCommandModels())
+	}
+	srv := &tcpGateway{
+		store: store,
+		pipeline: &iot.Pipeline{
+			Store: store, Hub: hub, Overspeed: overspeed,
+			Commands: store, Interlock: iot.DefaultInterlockConfig(),
+			CommandsEnabled: commandsEnabled,
+		},
+		sem: make(chan struct{}, maxTCPConns),
+	}
 	go srv.serve(listener)
 
 	stop := make(chan os.Signal, 1)
@@ -117,11 +130,10 @@ type tcpStore interface {
 }
 
 type tcpGateway struct {
-	store     tcpStore
-	hub       *iot.Hub
-	overspeed iot.OverspeedConfig
-	wg        sync.WaitGroup
-	sem       chan struct{}
+	store    tcpStore
+	pipeline *iot.Pipeline
+	wg       sync.WaitGroup
+	sem      chan struct{}
 }
 
 func (g *tcpGateway) serve(l net.Listener) {
@@ -240,42 +252,22 @@ func (g *tcpGateway) handle(conn net.Conn) {
 			continue
 		}
 
-		if _, err := g.store.InsertPings(opCtx, pings); err != nil {
+		// Persist + hot-state + geofence + overspeed + last-seen + hub fan-out,
+		// all in the shared pipeline. This gateway's job is decoding Codec 8 and
+		// deciding what counts as a usable fix; everything after that is
+		// identical across protocols and lives in one place so a new feature
+		// cannot reach one gateway and miss another.
+		if _, err := g.pipeline.Ingest(opCtx, device, pings, ipOnly(remote), logger); err != nil {
 			opCancel()
 			logger.Error("insert pings failed", "err", err)
 			return
 		}
-		newest := pings[0]
-		for _, p := range pings[1:] {
-			if p.TS.After(newest.TS) {
-				newest = p
-			}
-		}
-		if _, err := g.store.ApplyVehicleHotState(opCtx, newest); err != nil {
-			logger.Warn("registry sync failed after TCP ingest",
-				"vehicleId", device.VehicleID, "err", err)
-		}
-		if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(newest)); err != nil {
-			logger.Warn("geofence transitions failed after TCP ingest", "err", err)
-		}
-		// Same server-side speed monitoring as the SinoTrack path. Teltonika
-		// units have their own overspeed IO element, but keeping the rule here
-		// means one configurable limit per vehicle regardless of which tracker
-		// is fitted — rather than a threshold burned into each device.
-		if err := g.store.ApplyOverspeed(opCtx, newest, g.overspeed); err != nil {
-			logger.Warn("overspeed evaluation failed after TCP ingest", "err", err)
-		}
-		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
-			logger.Warn("mark device seen failed", "err", err)
-		}
+		// The device is connected and listening right now — the only moment a
+		// queued command can reach it.
+		g.pipeline.DeliverPendingCommand(opCtx, conn, device, logger)
 		opCancel()
 
 		_ = iot.WriteACK(conn, len(records))
-		if g.hub != nil {
-			for _, p := range pings {
-				g.hub.Publish(p)
-			}
-		}
 		logger.Info("pings persisted", "count", len(pings), "codec", codec)
 	}
 }

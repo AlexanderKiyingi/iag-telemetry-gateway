@@ -114,7 +114,8 @@ func (f *fakeStore) status() []statusObs {
 func runHandle(t *testing.T, store hqStore, frames ...string) {
 	t.Helper()
 	srv, cli := net.Pipe()
-	g := &hqGateway{store: store, sem: make(chan struct{}, 1)}
+	g := &hqGateway{store: store, sem: make(chan struct{}, 1),
+		pipeline: &iot.Pipeline{Store: store, Commands: store, Interlock: iot.DefaultInterlockConfig()}}
 
 	done := make(chan struct{})
 	go func() {
@@ -400,7 +401,7 @@ func TestDeliverCommand_refusesWithoutVerifiedEncoder(t *testing.T) {
 
 	srv, cli := net.Pipe()
 	g := &hqGateway{store: s, sem: make(chan struct{}, 1),
-		interlock: iot.DefaultInterlockConfig(), commandsEnabled: true}
+		pipeline: &iot.Pipeline{Store: s, Commands: s, Interlock: iot.DefaultInterlockConfig(), CommandsEnabled: true}}
 	done := make(chan struct{})
 	go func() { g.handle(srv); close(done) }()
 	_, _ = io.WriteString(cli, frameBound)
@@ -433,7 +434,7 @@ func TestDeliverCommand_refusesMovingVehicle(t *testing.T) {
 
 	srv, cli := net.Pipe()
 	g := &hqGateway{store: s, sem: make(chan struct{}, 1),
-		interlock: iot.DefaultInterlockConfig(), commandsEnabled: true}
+		pipeline: &iot.Pipeline{Store: s, Commands: s, Interlock: iot.DefaultInterlockConfig(), CommandsEnabled: true}}
 	done := make(chan struct{})
 	go func() { g.handle(srv); close(done) }()
 	_, _ = io.WriteString(cli, frameBound)

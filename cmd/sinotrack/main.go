@@ -71,7 +71,7 @@ func main() {
 		slog.Info("geofence POIs loaded", "count", len(iot.ActiveGeofencePOIs()))
 	}
 	geoCancel()
-	go refreshGeofencesPeriodically(store)
+	go store.StartGeofenceRefresh(context.Background())
 
 	overspeed := iot.OverspeedConfigFromEnv()
 	if overspeed.Enabled() {
@@ -121,25 +121,6 @@ func configureLogger() {
 // opening many sockets cannot exhaust goroutines/file descriptors. Connections
 // beyond the cap are rejected immediately rather than queued.
 const maxTCPConns = 2048
-
-// geofenceRefreshInterval is how often the POI set is reloaded. Geofences are
-// edited by hand and rarely, so this only needs to be short enough that a change
-// takes effect within a shift — not short enough to matter as query load.
-const geofenceRefreshInterval = 5 * time.Minute
-
-func refreshGeofencesPeriodically(store *iot.Store) {
-	t := time.NewTicker(geofenceRefreshInterval)
-	defer t.Stop()
-	for range t.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := store.RefreshGeofencePOIs(ctx); err != nil {
-			// Keep the previous set; a transient database blip must not turn
-			// geofencing off.
-			slog.Warn("geofence POI refresh failed, keeping previous set", "err", err)
-		}
-		cancel()
-	}
-}
 
 // hqStore is the subset of *iot.Store the connection loop uses. Narrowing it to
 // an interface lets the loop be tested with a fake store (no Postgres). The

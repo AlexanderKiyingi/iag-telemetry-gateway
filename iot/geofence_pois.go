@@ -2,7 +2,9 @@ package iot
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
+	"time"
 )
 
 // GeofencePOI is a point-of-interest with a circular geofence (km).
@@ -72,6 +74,38 @@ func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// GeofenceRefreshInterval is how often StartGeofenceRefresh reloads. Geofences
+// are edited by hand and rarely, so this only needs to be short enough that a
+// change takes effect within a shift.
+const GeofenceRefreshInterval = 5 * time.Minute
+
+// StartGeofenceRefresh keeps the active POI set current for the life of ctx.
+//
+// It lives here rather than in each gateway's main package on purpose: every
+// ingest path evaluates the same geofences, and a binary that forgot to start
+// this would silently run on the built-in defaults while its sibling used the
+// configured ones. One shared implementation, started by each gateway, is the
+// difference between "configurable geofences" and "geofences that depend on
+// which gateway your tracker happens to speak to".
+func (s *Store) StartGeofenceRefresh(ctx context.Context) {
+	t := time.NewTicker(GeofenceRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			if err := s.RefreshGeofencePOIs(refreshCtx); err != nil {
+				// Keep the previous set: a transient database blip must not
+				// turn geofencing off.
+				slog.Warn("geofence POI refresh failed, keeping previous set", "err", err)
+			}
+			cancel()
+		}
+	}
 }
 
 // RefreshGeofencePOIs reloads the active set from the database.

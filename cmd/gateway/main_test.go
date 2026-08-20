@@ -15,12 +15,14 @@ import (
 // fakeStore records the gateway's calls and mimics FindBySerial's active/known
 // checks, so the connection loop can be exercised without Postgres.
 type fakeStore struct {
-	mu       sync.Mutex
-	devices  map[string]*iot.Device // serial(IMEI) -> row
-	inserted []iot.Ping
-	hotState []iot.Ping
-	geofence int
-	markSeen int
+	mu        sync.Mutex
+	devices   map[string]*iot.Device // serial(IMEI) -> row
+	inserted  []iot.Ping
+	hotState  []iot.Ping
+	geofence  int
+	markSeen  int
+	overspeed []iot.Ping
+	protocol  string
 }
 
 func (f *fakeStore) FindBySerial(_ context.Context, serial string) (*iot.Device, error) {
@@ -97,9 +99,9 @@ func codec8Packet(ts time.Time, lng, lat float64) []byte {
 	body = append(body, 0x01) // priority
 	body = appendU32(body, uint32(int32(lng*1e7)))
 	body = appendU32(body, uint32(int32(lat*1e7)))
-	body = appendU16(body, 0)    // altitude
-	body = appendU16(body, 0)    // angle
-	body = append(body, 0x09)    // satellites
+	body = appendU16(body, 0)      // altitude
+	body = appendU16(body, 0)      // angle
+	body = append(body, 0x09)      // satellites
 	body = appendU16(body, 0x000A) // speed (10 km/h)
 
 	// IO element block: no IOs.
@@ -223,5 +225,53 @@ func TestHandleUnknownDeviceRejected(t *testing.T) {
 	insert, _, mark := s.counts()
 	if insert != 0 || mark != 0 {
 		t.Fatalf("unknown device must be rejected at handshake: insert=%d mark=%d", insert, mark)
+	}
+}
+
+func (f *fakeStore) ApplyOverspeed(_ context.Context, p iot.Ping, _ iot.OverspeedConfig) error {
+	f.mu.Lock()
+	f.overspeed = append(f.overspeed, p)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeStore) SetDeviceProtocol(_ context.Context, _ int64, protocol string) error {
+	f.mu.Lock()
+	f.protocol = protocol
+	f.mu.Unlock()
+	return nil
+}
+
+// Both gateways must evaluate the SAME geofences and the same speed rule.
+// When geofences moved into the database, only the SinoTrack gateway loaded
+// them — leaving Teltonika vehicles silently on the built-in defaults, so
+// whether a depot existed depended on which protocol the tracker spoke. These
+// assert the Teltonika path is wired to the shared machinery.
+func TestHandleAppliesOverspeedAndProtocol(t *testing.T) {
+	s := storeWith(&iot.Device{ID: 1, Serial: testIMEI, VehicleID: "VEH-001", IsActive: true})
+	runHandle(t, s, handshakeFrame(testIMEI), codec8Packet(time.Unix(1700000000, 0), 32.5825, 0.3476))
+
+	s.mu.Lock()
+	over, proto := len(s.overspeed), s.protocol
+	s.mu.Unlock()
+
+	if over == 0 {
+		t.Fatal("Teltonika ingest must evaluate overspeed, like the SinoTrack path")
+	}
+	if proto != iot.ProtocolTeltonika {
+		t.Fatalf("device protocol = %q, want %q", proto, iot.ProtocolTeltonika)
+	}
+}
+
+func TestGeofenceSetIsSharedAcrossGateways(t *testing.T) {
+	// A POI set loaded from the database by one gateway is the same set
+	// ProcessGeofences uses everywhere, because it is package-level state in
+	// iot rather than per-binary configuration.
+	iot.SetGeofencePOIs([]iot.GeofencePOI{{Name: "Shared Depot", Lat: 0.5, Lng: 32.6, Type: "site", RadiusKm: 1}})
+	t.Cleanup(func() { iot.SetGeofencePOIs(nil) })
+
+	tr := iot.ProcessGeofences(iot.Ping{VehicleID: "V1", Lat: 0.5, Lng: 32.6})
+	if len(tr) != 1 || tr[0].POIName != "Shared Depot" {
+		t.Fatalf("got %+v, want the shared depot — the Teltonika path must see DB-loaded POIs", tr)
 	}
 }

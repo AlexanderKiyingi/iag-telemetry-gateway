@@ -51,7 +51,26 @@ func main() {
 	}
 	slog.Info("telemetry TCP gateway listening", "addr", addr)
 
-	srv := &tcpGateway{store: store, hub: hub, sem: make(chan struct{}, maxTCPConns)}
+	// Geofences come from the database, exactly as in the SinoTrack gateway.
+	// Without this the two gateways would evaluate DIFFERENT geofence sets —
+	// Teltonika vehicles silently stuck on the built-in defaults while SinoTrack
+	// vehicles saw the configured ones. Non-fatal: the defaults still apply.
+	geoCtx, geoCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := store.RefreshGeofencePOIs(geoCtx); err != nil {
+		slog.Warn("geofence POIs: using built-in defaults", "err", err)
+	} else {
+		slog.Info("geofence POIs loaded", "count", len(iot.ActiveGeofencePOIs()))
+	}
+	geoCancel()
+	go store.StartGeofenceRefresh(context.Background())
+
+	overspeed := iot.OverspeedConfigFromEnv()
+	if overspeed.Enabled() {
+		slog.Info("overspeed monitoring on",
+			"defaultLimitKmh", overspeed.DefaultLimitKmh, "sustain", overspeed.MinBreachDuration)
+	}
+
+	srv := &tcpGateway{store: store, hub: hub, overspeed: overspeed, sem: make(chan struct{}, maxTCPConns)}
 	go srv.serve(listener)
 
 	stop := make(chan os.Signal, 1)
@@ -93,13 +112,16 @@ type tcpStore interface {
 	InsertPings(ctx context.Context, pings []iot.Ping) (int, error)
 	ApplyVehicleHotState(ctx context.Context, p iot.Ping) (iot.StatusSyncResult, error)
 	ApplyGeofenceTransitions(ctx context.Context, transitions []iot.GeofenceTransition) error
+	ApplyOverspeed(ctx context.Context, p iot.Ping, cfg iot.OverspeedConfig) error
+	SetDeviceProtocol(ctx context.Context, deviceID int64, protocol string) error
 }
 
 type tcpGateway struct {
-	store tcpStore
-	hub   *iot.Hub
-	wg    sync.WaitGroup
-	sem   chan struct{}
+	store     tcpStore
+	hub       *iot.Hub
+	overspeed iot.OverspeedConfig
+	wg        sync.WaitGroup
+	sem       chan struct{}
 }
 
 func (g *tcpGateway) serve(l net.Listener) {
@@ -161,6 +183,11 @@ func (g *tcpGateway) handle(conn net.Conn) {
 	}
 	if err := g.store.MarkSeen(hsCtx, device.ID, ipOnly(remote)); err != nil {
 		logger.Warn("mark device seen failed", "err", err)
+	}
+	// Record the wire protocol, so "why is this unit silent" is a column lookup
+	// and a tracker dialling the wrong gateway is immediately visible.
+	if err := g.store.SetDeviceProtocol(hsCtx, device.ID, iot.ProtocolTeltonika); err != nil {
+		logger.Warn("record device protocol failed", "err", err)
 	}
 	cancel()
 	// The binding is fixed for the connection's life, so warn once here rather
@@ -231,6 +258,13 @@ func (g *tcpGateway) handle(conn net.Conn) {
 		if err := g.store.ApplyGeofenceTransitions(opCtx, iot.ProcessGeofences(newest)); err != nil {
 			logger.Warn("geofence transitions failed after TCP ingest", "err", err)
 		}
+		// Same server-side speed monitoring as the SinoTrack path. Teltonika
+		// units have their own overspeed IO element, but keeping the rule here
+		// means one configurable limit per vehicle regardless of which tracker
+		// is fitted — rather than a threshold burned into each device.
+		if err := g.store.ApplyOverspeed(opCtx, newest, g.overspeed); err != nil {
+			logger.Warn("overspeed evaluation failed after TCP ingest", "err", err)
+		}
 		if err := g.store.MarkSeen(opCtx, device.ID, ipOnly(remote)); err != nil {
 			logger.Warn("mark device seen failed", "err", err)
 		}
@@ -247,9 +281,9 @@ func (g *tcpGateway) handle(conn net.Conn) {
 }
 
 const (
-	ioIDIgnition   uint16 = 239
-	ioIDOdoMeters  uint16 = 199
-	ioIDFuelPct    uint16 = 89
+	ioIDIgnition  uint16 = 239
+	ioIDOdoMeters uint16 = 199
+	ioIDFuelPct   uint16 = 89
 )
 
 func recordToPing(rec iot.AVLRecord, device *iot.Device) iot.Ping {

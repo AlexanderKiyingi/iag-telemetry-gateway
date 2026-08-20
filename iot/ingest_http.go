@@ -32,9 +32,9 @@ type IngestPingBody struct {
 // IngestBatchResult is the HTTP ingest outcome. Pings are persisted even when
 // registry sync fails; callers can inspect RegistrySync* for partial failures.
 type IngestBatchResult struct {
-	Accepted            int    `json:"accepted"`
-	RegistrySyncFailed  bool   `json:"registrySyncFailed,omitempty"`
-	RegistrySyncError   string `json:"registrySyncError,omitempty"`
+	Accepted           int    `json:"accepted"`
+	RegistrySyncFailed bool   `json:"registrySyncFailed,omitempty"`
+	RegistrySyncError  string `json:"registrySyncError,omitempty"`
 }
 
 // IngestHTTPBatch authenticates via device API key, validates, persists pings,
@@ -116,6 +116,12 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 		}
 		if err := store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest)); err != nil {
 			slog.Warn("geofence transitions failed after ingest",
+				"vehicleId", newest.VehicleID, "err", err)
+		}
+		// Speed monitoring applies to every ingest path, not just the TCP
+		// gateways — a vehicle relaying over HTTP is still a vehicle.
+		if err := store.ApplyOverspeed(ctx, *newest, OverspeedConfigFromEnv()); err != nil {
+			slog.Warn("overspeed evaluation failed after ingest",
 				"vehicleId", newest.VehicleID, "err", err)
 		}
 	}

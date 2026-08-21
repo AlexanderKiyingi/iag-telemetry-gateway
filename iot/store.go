@@ -261,10 +261,34 @@ func (s *Store) RotateAPIKey(ctx context.Context, id int64) (string, error) {
 	return plaintext, nil
 }
 
+// MarkSeenInterval is how stale iot_devices.last_seen is allowed to get.
+//
+// This UPDATE used to run on every ping. A tracker reporting every ten seconds
+// therefore rewrote its own registry row 8,640 times a day, for a column whose
+// only job is answering "when did we last hear from this unit" — a question
+// nobody asks to the second. Those writes are pure dead-tuple production on a
+// small, frequently-read table, and they were competing with user traffic on
+// the one shared Postgres.
+//
+// A minute is well inside the resolution any operator uses to decide a unit has
+// gone quiet (the stale-vehicle job works in tens of minutes), and it cuts the
+// write rate by ~60x.
+const MarkSeenInterval = time.Minute
+
+// MarkSeen records that a device is alive, at most once per MarkSeenInterval.
+//
+// The throttle is in SQL, not in process memory, so it holds across gateway
+// restarts and across replicas — an in-memory last-written map would let every
+// instance write once per interval each, and would forget on deploy.
 func (s *Store) MarkSeen(ctx context.Context, deviceID int64, ip string) error {
-	_, err := s.op().Exec(ctx,
-		`UPDATE iot_devices SET last_seen = NOW(), last_ip = NULLIF($2, '') WHERE id = $1`,
-		deviceID, ip,
+	_, err := s.op().Exec(ctx, `
+		UPDATE iot_devices
+		   SET last_seen = NOW(), last_ip = NULLIF($2, '')
+		 WHERE id = $1
+		   AND (last_seen IS NULL
+		        OR last_seen < NOW() - $3::interval
+		        OR last_ip IS DISTINCT FROM NULLIF($2, ''))`,
+		deviceID, ip, MarkSeenInterval.String(),
 	)
 	return err
 }
@@ -715,7 +739,50 @@ func (s *Store) FuelSummary(ctx context.Context, vehicleID string, from, to time
 }
 
 // PurgeBefore drops pings older than the cutoff. Called by cmd/telemetry-purge.
+//
+// On a Timescale hypertable this uses drop_chunks, which unlinks whole chunks
+// as a metadata operation. The DELETE it replaces walked and marked every
+// individual row: on a table taking ~1.7M rows a day that is a long-running,
+// WAL-heavy statement that leaves behind exactly as many dead tuples as it
+// removed rows, for autovacuum to chase afterwards — all on the instance
+// serving user traffic at the time.
+//
+// drop_chunks only removes chunks lying ENTIRELY before the cutoff, so the
+// retention boundary is now chunk-granular rather than row-granular: some rows
+// slightly older than the cutoff survive until their whole chunk ages out.
+// That is the standard trade and the right one here — retention is a policy in
+// days, not a promise to the second. The returned count is chunks dropped, not
+// rows, which is why the caller logs it with its own wording.
+//
+// Without the extension (local dev on plain Postgres) it falls back to the
+// bounded DELETE.
 func (s *Store) PurgeBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	var isHypertable bool
+	err := s.tel().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM timescaledb_information.hypertables
+			 WHERE hypertable_name = $1
+		)`, PingsTable).Scan(&isHypertable)
+	if err != nil {
+		// No timescaledb_information schema means no extension: fall through
+		// to the DELETE rather than failing the purge entirely.
+		isHypertable = false
+	}
+
+	if isHypertable {
+		rows, derr := s.tel().Query(ctx,
+			`SELECT drop_chunks($1, older_than => $2::timestamptz)`, PingsTable, cutoff)
+		if derr != nil {
+			return 0, fmt.Errorf("drop_chunks %s: %w", PingsTable, derr)
+		}
+		defer rows.Close()
+		var dropped int64
+		for rows.Next() {
+			dropped++
+		}
+		return dropped, rows.Err()
+	}
+
 	tag, err := s.tel().Exec(ctx, sqlPurgeBefore, cutoff)
 	if err != nil {
 		return 0, err

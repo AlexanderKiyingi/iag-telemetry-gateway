@@ -2,12 +2,9 @@ package iot
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // GeofenceTransition is emitted when a vehicle enters or leaves a POI geofence.
@@ -35,15 +32,46 @@ func ProcessGeofences(p Ping) []GeofenceTransition {
 }
 
 // ApplyGeofenceTransitions persists state and creates safety_events on enter/exit.
+//
+// One read for the whole POI set, not one per POI. ProcessGeofences returns a
+// transition for every active point of interest — six by default, more once the
+// geofence_pois table is populated — and this used to issue a separate
+// `SELECT inside FROM vehicle_geofence_state WHERE vehicle_id = $1 AND poi_name
+// = $2` for each of them, on every ping. That was the single largest
+// contributor to the ingest path's round-trip count, and it grew with the
+// number of sites rather than staying flat.
+//
+// The writes stay per-transition because in the steady state there are none:
+// a vehicle's inside/outside relationship to a site changes on the order of
+// times per day, not times per ping, so the loop below almost always falls
+// through on the `prevInside == tr.Entered` check having done no I/O at all.
 func (s *Store) ApplyGeofenceTransitions(ctx context.Context, transitions []GeofenceTransition) error {
+	if len(transitions) == 0 {
+		return nil
+	}
+	vehicleID := ""
+	names := make([]string, 0, len(transitions))
 	for _, tr := range transitions {
 		if tr.Ping.VehicleID == "" {
 			continue
 		}
-		prevInside, known, err := s.geofenceWasInside(ctx, tr.Ping.VehicleID, tr.POIName)
-		if err != nil {
-			return err
+		vehicleID = tr.Ping.VehicleID
+		names = append(names, tr.POIName)
+	}
+	if vehicleID == "" {
+		return nil
+	}
+
+	prior, err := s.geofenceStateFor(ctx, vehicleID, names)
+	if err != nil {
+		return err
+	}
+
+	for _, tr := range transitions {
+		if tr.Ping.VehicleID == "" {
+			continue
 		}
+		prevInside, known := prior[tr.POIName]
 		if known && prevInside == tr.Entered {
 			continue
 		}
@@ -61,16 +89,33 @@ func (s *Store) ApplyGeofenceTransitions(ctx context.Context, transitions []Geof
 	return nil
 }
 
-func (s *Store) geofenceWasInside(ctx context.Context, vehicleID, poiName string) (inside bool, known bool, err error) {
-	const q = `SELECT inside FROM vehicle_geofence_state WHERE vehicle_id = $1 AND poi_name = $2`
-	err = s.op().QueryRow(ctx, q, vehicleID, poiName).Scan(&inside)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, false, nil
-		}
-		return false, false, err
+// geofenceStateFor reads this vehicle's inside/outside flag for every named POI
+// in one query. A POI absent from the map has never been observed for this
+// vehicle, which is what distinguishes "first sighting, record it silently"
+// from "a real crossing, raise a safety event".
+func (s *Store) geofenceStateFor(ctx context.Context, vehicleID string, poiNames []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(poiNames))
+	if len(poiNames) == 0 {
+		return out, nil
 	}
-	return inside, true, nil
+	const q = `
+        SELECT poi_name, inside
+          FROM vehicle_geofence_state
+         WHERE vehicle_id = $1 AND poi_name = ANY($2)`
+	rows, err := s.op().Query(ctx, q, vehicleID, poiNames)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var inside bool
+		if err := rows.Scan(&name, &inside); err != nil {
+			return nil, err
+		}
+		out[name] = inside
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) upsertGeofenceState(ctx context.Context, vehicleID, poiName string, inside bool, ts time.Time) error {

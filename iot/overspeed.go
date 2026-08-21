@@ -140,17 +140,15 @@ func (s *Store) ApplyOverspeed(ctx context.Context, p Ping, cfg OverspeedConfig)
 	if p.VehicleID == "" || p.SpeedKmh == nil {
 		return nil
 	}
-	limit, err := s.resolveSpeedLimit(ctx, p.VehicleID, cfg.DefaultLimitKmh)
+	// The speed limit and the breach state are two rows keyed by the same
+	// vehicle id, so they are one round trip, not two. This runs on every ping
+	// with a speed reading — which is nearly all of them.
+	limit, prev, err := s.loadOverspeedContext(ctx, p.VehicleID, cfg.DefaultLimitKmh)
 	if err != nil {
 		return err
 	}
 	if limit <= 0 {
 		return nil
-	}
-
-	prev, err := s.loadOverspeedState(ctx, p.VehicleID)
-	if err != nil {
-		return err
 	}
 	minDur := cfg.MinBreachDuration
 	if minDur == 0 && cfg.MinBreachDuration == 0 {
@@ -169,42 +167,55 @@ func (s *Store) ApplyOverspeed(ctx context.Context, p Ping, cfg OverspeedConfig)
 	return s.insertOverspeedSafetyEvent(ctx, p, d)
 }
 
-// resolveSpeedLimit prefers the vehicle's own limit; a stored 0 disables
-// monitoring for that vehicle even when a fleet default exists.
-func (s *Store) resolveSpeedLimit(ctx context.Context, vehicleID string, fallback float64) (float64, error) {
+// loadOverspeedContext reads the applicable speed limit and the current breach
+// state in one round trip.
+//
+// The limit prefers the vehicle's own value; a stored 0 disables monitoring for
+// that vehicle even when a fleet default exists, and an unknown vehicle returns
+// 0 so nothing is evaluated. A vehicle with no state row yet is not an error —
+// it is the zero state, meaning "not currently breaching".
+//
+// The LEFT JOIN matters for that last case: a vehicle that has never breached
+// has a row in `vehicles` and none in `vehicle_overspeed_state`, and an inner
+// join would silently stop monitoring exactly the vehicles that have behaved.
+func (s *Store) loadOverspeedContext(ctx context.Context, vehicleID string, fallback float64) (float64, overspeedState, error) {
 	var limit *float64
-	err := s.op().QueryRow(ctx,
-		`SELECT speed_limit_kmh FROM vehicles WHERE id = $1`, vehicleID,
-	).Scan(&limit)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if limit != nil {
-		return *limit, nil
-	}
-	return fallback, nil
-}
-
-func (s *Store) loadOverspeedState(ctx context.Context, vehicleID string) (overspeedState, error) {
 	var st overspeedState
+	var breaching, alerted *bool
 	var started *time.Time
+	var peak *float64
+
 	err := s.op().QueryRow(ctx, `
-		SELECT breaching, breach_started_at, peak_speed_kmh, alerted
-		  FROM vehicle_overspeed_state WHERE vehicle_id = $1`, vehicleID,
-	).Scan(&st.breaching, &started, &st.peakKmh, &st.alerted)
+		SELECT v.speed_limit_kmh,
+		       o.breaching, o.breach_started_at, o.peak_speed_kmh, o.alerted
+		  FROM vehicles v
+		  LEFT JOIN vehicle_overspeed_state o ON o.vehicle_id = v.id
+		 WHERE v.id = $1`, vehicleID,
+	).Scan(&limit, &breaching, &started, &peak, &alerted)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return overspeedState{}, nil
+		return 0, overspeedState{}, nil
 	}
 	if err != nil {
-		return overspeedState{}, err
+		return 0, overspeedState{}, err
+	}
+
+	if breaching != nil {
+		st.breaching = *breaching
+	}
+	if alerted != nil {
+		st.alerted = *alerted
+	}
+	if peak != nil {
+		st.peakKmh = *peak
 	}
 	if started != nil {
 		st.startedAt = *started
 	}
-	return st, nil
+
+	if limit != nil {
+		return *limit, st, nil
+	}
+	return fallback, st, nil
 }
 
 func (s *Store) saveOverspeedState(ctx context.Context, vehicleID string, st overspeedState, ts time.Time) error {

@@ -36,7 +36,7 @@ func (s *Store) EnqueueCommand(ctx context.Context, deviceID int64, vehicleID, k
 	err := s.op().QueryRow(ctx, `
 		INSERT INTO device_commands (device_id, vehicle_id, kind, requested_by, expires_at)
 		VALUES ($1, NULLIF($2,''), $3, $4, NOW() + $5::interval)
-		RETURNING id, device_id, COALESCE(vehicle_id,''), kind, status, requested_by, requested_at, expires_at`,
+		RETURNING id, device_id, COALESCE(vehicle_id::text,''), kind, status, requested_by, requested_at, expires_at`,
 		deviceID, vehicleID, kind, requestedBy, ttl.String(),
 	).Scan(&c.ID, &c.DeviceID, &c.VehicleID, &c.Kind, &c.Status, &c.RequestedBy, &c.RequestedAt, &c.ExpiresAt)
 	if err != nil {
@@ -52,7 +52,7 @@ var ErrCommandPending = errors.New("command: this device already has a pending c
 func (s *Store) NextPendingCommand(ctx context.Context, deviceID int64) (*DeviceCommand, error) {
 	var c DeviceCommand
 	err := s.op().QueryRow(ctx, `
-		SELECT id, device_id, COALESCE(vehicle_id,''), kind, status, requested_by, requested_at, expires_at
+		SELECT id, device_id, COALESCE(vehicle_id::text,''), kind, status, requested_by, requested_at, expires_at
 		  FROM device_commands
 		 WHERE device_id = $1 AND status = 'pending'
 		 ORDER BY requested_at

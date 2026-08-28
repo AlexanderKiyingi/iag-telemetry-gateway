@@ -78,7 +78,7 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 	const q = `
         INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash)
         VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''))
-        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                   api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
 	var d Device
 	err := s.op().QueryRow(ctx, q, in.Serial, in.Label, in.VehicleID, keyHash).Scan(
@@ -93,7 +93,7 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 
 func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices ORDER BY created_at DESC`
 	rows, err := s.op().Query(ctx, q)
@@ -117,7 +117,7 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 
 func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
 	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices WHERE id = $1`
 	var d Device
@@ -136,7 +136,7 @@ func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
 // ErrInactiveDevice if the device is registered but disabled.
 func (s *Store) FindBySerial(ctx context.Context, serial string) (*Device, error) {
 	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at,
                COALESCE(model,''), COALESCE(protocol,'')
         FROM iot_devices WHERE serial = $1`
@@ -167,7 +167,7 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, plaintext string) (*Devi
 	}
 	digest := hashAPIKey(plaintext)
 	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
         FROM iot_devices WHERE api_key_hash = $1`
 	var d Device
@@ -217,7 +217,7 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
             vehicle_id = CASE WHEN $4 THEN NULLIF($5::text, '') ELSE vehicle_id END,
             is_active  = CASE WHEN $6 THEN $7::bool ELSE is_active END
         WHERE id = $1
-        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id,''),
+        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                   api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
 	var d Device
 	err := s.op().QueryRow(ctx, q, id, labelSet, labelVal, vehicleSet, vehicleVal, activeSet, activeVal).Scan(

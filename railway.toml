@@ -1,0 +1,83 @@
+# Railway config-as-code for iag-telemetry-gateway (repo root = service root).
+# https://docs.railway.com/config-as-code/reference
+#
+# This file configures the HTTP ingest listener (`/app/ingest`), which is the
+# Dockerfile's default entrypoint. It does NOT configure the two TCP listeners —
+# see "TCP listeners" at the bottom.
+#
+# ── Why HTTP ingest needs no public domain ────────────────────────────────────
+#
+# The API gateway already fronts it. `iag-api-gateway` carries a route
+# registered BEFORE /api/v1/fleet:
+#
+#     /api/v1/fleet/api/iot/pings  →  UPSTREAM_FLEET_IOT_INGEST
+#     rewritePrefix: /api/iot/pings
+#
+# and a policy marking POST on that prefix `public: true`. So the gateway does
+# not demand a platform JWT: the device's own `Authorization: Bearer <api-key>`
+# passes straight through and this service validates it against `iot_devices`.
+#
+# That makes the public device endpoint, today, with no new domain:
+#
+#     POST https://iag-api-gateway-production.up.railway.app/api/v1/fleet/api/iot/pings
+#
+# So this service should stay on the private network. Give it no public domain;
+# point UPSTREAM_FLEET_IOT_INGEST on the gateway at its internal address:
+#
+#     UPSTREAM_FLEET_IOT_INGEST=http://<service>.railway.internal:4080
+#
+# and set TELEMETRY_INGEST_URL on iag-fleet to the gateway's fleet prefix
+# (`https://iag-api-gateway-production.up.railway.app/api/v1/fleet`) so
+# GET /api/iot/ingestion hands operators the URL above rather than reporting
+# that ingest is unconfigured.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Both /healthz and /ready exist and are unauthenticated; /ready matches the
+# convention every other service in deploy/RAILWAY.md uses.
+healthcheckPath = "/ready"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Railway injects PORT; cmd/ingest prefers ADDR, then PORT, then :4080. Leaving
+# PORT to Railway is fine — do not also set ADDR, or PORT is ignored and the
+# healthcheck hits a port nothing is listening on.
+#
+# Required variables:
+#   DATABASE_URL           telemetry schema (telemetry_timeseries)
+#   REGISTRY_DATABASE_URL  operational fleet DB — iot_devices lookup for API-key
+#                          auth, and SyncVehicleFromPing writing vehicles.lat/
+#                          lng/speed/last_seen. Without it a ping is stored but
+#                          the live map never moves. Same DSN as fleet's
+#                          DATABASE_URL on the shared-database topology.
+# Optional:
+#   REDIS_URL              live SSE/WS fan-out to fleet API replicas. Without
+#                          it, a ping reaches the fleet service only via its
+#                          own polled query, so the live map lags by a tick.
+#   EVENT_BUS_ENABLED      enqueue fleet.vehicle.status_changed to the outbox
+#   LOG_FORMAT=json        matches the rest of the platform
+
+# Ingest is stateless and horizontally safe — every write is
+# INSERT ... ON CONFLICT (vehicle_id, ts) DO NOTHING — but held at 1 for the
+# same reason as the fleet service: pools are sized per instance against one
+# shared Postgres, and there is no PgBouncer in front of it yet.
+numReplicas = 1
+
+# ── TCP listeners ─────────────────────────────────────────────────────────────
+#
+# `/app/gateway` (Teltonika Codec 8/8E, :5027) and `/app/sinotrack`
+# (SinoTrack/HQ, :5013) are NOT covered by this file. They speak raw TCP, which
+# an HTTP gateway cannot carry, so each needs its own Railway service built from
+# this same image with the entrypoint overridden and a Railway TCP Proxy in
+# front. Deploy them as separate services with:
+#
+#     [deploy] startCommand = "/app/gateway"      # or "/app/sinotrack"
+#
+# and note the ST-901 caveat in docs/ST-901-onboarding.md: most firmwares want a
+# literal IP address, and a Railway TCP Proxy gives a domain:port. If the
+# firmware will not take a hostname, terminate those on something with a stable
+# public IP instead.

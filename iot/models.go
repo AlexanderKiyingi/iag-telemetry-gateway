@@ -35,6 +35,13 @@ type Device struct {
 	// Protocol is the wire protocol last seen from this device. Set on connect,
 	// so a unit dialling the wrong gateway is visible without reading logs.
 	Protocol string `json:"protocol,omitempty"`
+	// Fuel sensor mapping (fleet migration 0047). Which IO element carries fuel
+	// and how its raw units become a percentage differs per sensor: CAN reports
+	// tenths of a percent, an analog sender reports millivolts, an LLS probe
+	// reports a raw count. See fuel_sensor.go.
+	FuelIOID   uint16  `json:"fuelIoId"`
+	FuelScale  float64 `json:"fuelScale"`
+	FuelOffset float64 `json:"fuelOffset"`
 }
 
 // Wire protocols a device may speak. SinoTrack ships both HQ-protocol and

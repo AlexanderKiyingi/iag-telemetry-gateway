@@ -50,6 +50,41 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 | `IOT_ADDR` | no | Teltonika TCP gateway (default `:5027`) |
 | `SINOTRACK_ADDR` | no | SinoTrack/HQ TCP gateway (default `:5013`) |
 
+## Fuel sensors
+
+Which IO element carries fuel, and how its raw units become a percentage, is
+configured **per device** (`iot_devices.fuel_io_id` / `fuel_scale` /
+`fuel_offset`, fleet migration 0047). It used to be one hardcoded constant —
+Teltonika IO 89, CAN fuel level in tenths of a percent — which exists only on a
+unit wired to a CAN adapter, so the two sensors most often fitted to a truck
+were unreadable.
+
+    fuel_percent = raw_value * fuel_scale + fuel_offset   (clamped 0-100)
+
+| Sensor | `fuel_io_id` | `fuel_scale` | `fuel_offset` |
+|--------|-------------|--------------|---------------|
+| CAN fuel level, percent (default) | `89` | `0.1` | `0` |
+| LLS capacitive probe, 0-4095 | `201` | `0.024420` | `0` |
+| Analog sender on AIN1, 0.5-4.5 V (mV) | `9` | `0.025` | `-12.5` |
+| No fuel sensor | `0` | — | — |
+
+Confirm the id against the unit's own IO list before relying on the table:
+numbering varies by model, firmware and CAN adapter. Set it at registration or
+later — calibration is normally measured against a known tank level once the
+sensor is in the vehicle:
+
+```sh
+PATCH /api/iot/devices/:id  { "fuelIoId": 201, "fuelScale": 0.024420 }
+```
+
+The defaults reproduce the previous hardcoded behaviour, so an existing fleet
+reads exactly as it did until a device is deliberately reconfigured.
+
+Every fixed-width IO element the device sends is stored in
+`telemetry_timeseries.raw` regardless of configuration, and since Codec 8E
+variable-length elements are kept too, a mapping corrected later can be
+backfilled from history rather than needing the fleet re-driven.
+
 ## Smoke-testing SinoTrack without hardware
 
 `cmd/hqreplay` is a dev-only TCP client that feeds HQ frames to a running

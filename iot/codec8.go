@@ -46,9 +46,13 @@ type AVLRecord struct {
 	Altitude   int16
 	Angle      uint16
 	Satellites uint8
-	Speed      uint16          // km/h; 0xFFFF means unknown
-	EventIOID  uint16          // 1 byte for codec 8, 2 bytes for codec 8E
+	Speed      uint16           // km/h; 0xFFFF means unknown
+	EventIOID  uint16           // 1 byte for codec 8, 2 bytes for codec 8E
 	IOs        map[uint16]int64 // value coerced to int64; original size preserved in IOSizes
+	// VarIOs holds Codec 8E variable-length IO elements, keyed by id. Opaque
+	// byte strings (CAN frames, driver IDs); nil on Codec 8, which has no such
+	// block.
+	VarIOs map[uint16][]byte
 }
 
 var (
@@ -241,14 +245,28 @@ func parseRecord(b []byte, codec byte) (AVLRecord, int, error) {
 				return rec, 0, fmt.Errorf("short 8E variable element header")
 			}
 			// id (2) + length (2) + payload (length)
+			id := binary.BigEndian.Uint16(b[cur : cur+2])
 			length := int(binary.BigEndian.Uint16(b[cur+2 : cur+4]))
-			cur += 4 + length
-			if cur > len(b) {
+			cur += 4
+			if cur+length > len(b) {
 				return rec, 0, fmt.Errorf("short 8E variable payload")
 			}
-			// Variable IOs are device-specific (CAN frames, etc); skip the
-			// payload but advance the cursor. Could be persisted into raw
-			// JSON later if needed.
+			// Keep the payload. These are device-specific opaque strings — CAN
+			// frames, driver IDs — with no single numeric reading, which is why
+			// they used to be skipped outright. But skipping them threw away the
+			// only record of what the device sent, and on a CAN-adapter unit
+			// that is where some of the vehicle data lives. Stored as bytes and
+			// hex-encoded into raw; a decoder that learns to read one can be
+			// backfilled from history rather than needing the fleet re-driven.
+			if length > 0 {
+				if rec.VarIOs == nil {
+					rec.VarIOs = make(map[uint16][]byte, nx)
+				}
+				payload := make([]byte, length)
+				copy(payload, b[cur:cur+length])
+				rec.VarIOs[id] = payload
+			}
+			cur += length
 		}
 	}
 	return rec, cur, nil

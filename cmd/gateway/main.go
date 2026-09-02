@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -272,10 +273,13 @@ func (g *tcpGateway) handle(conn net.Conn) {
 	}
 }
 
+// Ignition and odometer are stable across the Teltonika FMB range, so they stay
+// constants. Fuel does not: which element carries it depends on whether the
+// vehicle has CAN, an analog sender, or an LLS probe, so it comes from the
+// device's own configuration. See iot/fuel_sensor.go and fleet migration 0047.
 const (
 	ioIDIgnition  uint16 = 239
 	ioIDOdoMeters uint16 = 199
-	ioIDFuelPct   uint16 = 89
 )
 
 func recordToPing(rec iot.AVLRecord, device *iot.Device) iot.Ping {
@@ -295,8 +299,7 @@ func recordToPing(rec iot.AVLRecord, device *iot.Device) iot.Ping {
 		odoKm := float64(v) / 1000.0
 		p.Odo = &odoKm
 	}
-	if v, ok := rec.IOs[ioIDFuelPct]; ok {
-		pct := float64(v) / 10.0
+	if pct, ok := device.FuelSensor().FuelFrom(rec.IOs); ok {
 		p.FuelLevel = &pct
 	}
 	if v, ok := rec.IOs[ioIDIgnition]; ok {
@@ -307,17 +310,28 @@ func recordToPing(rec iot.AVLRecord, device *iot.Device) iot.Ping {
 		ev := int(rec.EventIOID)
 		p.EventID = &ev
 	}
-	p.Raw = encodeIOMap(rec.IOs)
+	p.Raw = encodeIOMap(rec.IOs, rec.VarIOs)
 	return p
 }
 
-func encodeIOMap(m map[uint16]int64) []byte {
-	if len(m) == 0 {
+// encodeIOMap renders the device's IO elements into telemetry_timeseries.raw.
+//
+// Fixed-width elements go in as numbers under their id. Variable-length ones —
+// which the 8E parser used to skip entirely — go in hex-encoded under the same
+// id prefixed with "v", because they are opaque byte strings (CAN frames, driver
+// IDs) with no single numeric reading. Keeping them matters for the same reason
+// the fixed map is kept: it is the only record of what the device actually sent,
+// and it is what a later decode gets backfilled from.
+func encodeIOMap(m map[uint16]int64, varIOs map[uint16][]byte) []byte {
+	if len(m) == 0 && len(varIOs) == 0 {
 		return []byte(`{}`)
 	}
-	out := make(map[string]int64, len(m))
+	out := make(map[string]any, len(m)+len(varIOs))
 	for k, v := range m {
 		out[strconv.Itoa(int(k))] = v
+	}
+	for k, v := range varIOs {
+		out["v"+strconv.Itoa(int(k))] = hex.EncodeToString(v)
 	}
 	b, _ := json.Marshal(out)
 	return b

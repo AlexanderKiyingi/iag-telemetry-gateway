@@ -58,11 +58,52 @@ type CreateDeviceInput struct {
 	Label     string
 	VehicleID string
 	IssueKey  bool // when true, a fresh API key is generated; the plaintext is returned once
+	// Model keys the status-word bit map and the immobilise command encoder. It
+	// had no writer at all until now, so it stayed empty however a device was
+	// provisioned and both features were unreachable.
+	Model string
+	// Fuel sensor mapping. Nil keeps the column default (Teltonika CAN percent),
+	// which is what every device did before migration 0047.
+	FuelIOID   *uint16
+	FuelScale  *float64
+	FuelOffset *float64
 }
 
 type CreatedDevice struct {
 	Device
 	APIKeyPlaintext string `json:"apiKey,omitempty"`
+}
+
+// deviceCols is the one column list every device read uses, and scanDevice
+// is the one place that maps it onto the struct.
+//
+// They exist because the list had been copy-pasted into five queries and had
+// already drifted: only FindBySerial selected model and protocol, so a device
+// loaded by list, get, or API-key auth reported an empty model however it was
+// provisioned. That silently disabled the per-model status-word decoding and
+// made EncodeCommand refuse every immobilise, while the operator UI showed a
+// permanently blank Model column with no way to tell it was a read bug rather
+// than unset data. Adding the fuel columns to five separate lists would have
+// been the same mistake a second time.
+const deviceCols = `id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
+               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at,
+               COALESCE(model,''), COALESCE(protocol,''),
+               fuel_io_id, fuel_scale, fuel_offset`
+
+// deviceScanner is satisfied by both pgx.Row and pgx.Rows.
+type deviceScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDevice(row deviceScanner) (Device, error) {
+	var d Device
+	err := row.Scan(
+		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
+		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
+		&d.Model, &d.Protocol,
+		&d.FuelIOID, &d.FuelScale, &d.FuelOffset,
+	)
+	return d, err
 }
 
 func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*CreatedDevice, error) {
@@ -75,16 +116,32 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 		plaintext = base64.RawURLEncoding.EncodeToString(buf)
 		keyHash = hashAPIKey(plaintext)
 	}
-	const q = `
-        INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash)
-        VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''))
-        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-                  api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
-	var d Device
-	err := s.op().QueryRow(ctx, q, in.Serial, in.Label, in.VehicleID, keyHash).Scan(
-		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-	)
+	// The fuel columns go through NULLIF/COALESCE rather than straight through:
+	// a caller that omits them sends zeros, and a zero scale violates the CHECK
+	// added in migration 0047. Omitted has to mean "keep the column default",
+	// not "set it to zero".
+	q := `
+        INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash, model,
+                                 fuel_io_id, fuel_scale, fuel_offset)
+        VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''),
+                COALESCE(NULLIF($6, -1), 89),
+                COALESCE(NULLIF($7, 0::double precision), 0.1),
+                $8)
+        RETURNING ` + deviceCols
+	fuelIO := -1
+	if in.FuelIOID != nil {
+		fuelIO = int(*in.FuelIOID)
+	}
+	var fuelScale, fuelOffset float64
+	if in.FuelScale != nil {
+		fuelScale = *in.FuelScale
+	}
+	if in.FuelOffset != nil {
+		fuelOffset = *in.FuelOffset
+	}
+	d, err := scanDevice(s.op().QueryRow(ctx, q,
+		in.Serial, in.Label, in.VehicleID, keyHash, in.Model,
+		fuelIO, fuelScale, fuelOffset))
 	if err != nil {
 		return nil, err
 	}
@@ -92,10 +149,7 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 }
 
 func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
-	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
-        FROM iot_devices ORDER BY created_at DESC`
+	q := `SELECT ` + deviceCols + ` FROM iot_devices ORDER BY created_at DESC`
 	rows, err := s.op().Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -103,11 +157,8 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	defer rows.Close()
 	var out []Device
 	for rows.Next() {
-		var d Device
-		if err := rows.Scan(
-			&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-			&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-		); err != nil {
+		d, err := scanDevice(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -116,15 +167,8 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 }
 
 func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
-	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
-        FROM iot_devices WHERE id = $1`
-	var d Device
-	err := s.op().QueryRow(ctx, q, id).Scan(
-		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-	)
+	q := `SELECT ` + deviceCols + ` FROM iot_devices WHERE id = $1`
+	d, err := scanDevice(s.op().QueryRow(ctx, q, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceNotFound
 	}
@@ -135,17 +179,8 @@ func (s *Store) GetDevice(ctx context.Context, id int64) (*Device, error) {
 // connection by IMEI. Returns ErrDeviceNotFound if the serial is unknown,
 // ErrInactiveDevice if the device is registered but disabled.
 func (s *Store) FindBySerial(ctx context.Context, serial string) (*Device, error) {
-	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at,
-               COALESCE(model,''), COALESCE(protocol,'')
-        FROM iot_devices WHERE serial = $1`
-	var d Device
-	err := s.op().QueryRow(ctx, q, serial).Scan(
-		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-		&d.Model, &d.Protocol,
-	)
+	q := `SELECT ` + deviceCols + ` FROM iot_devices WHERE serial = $1`
+	d, err := scanDevice(s.op().QueryRow(ctx, q, serial))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceNotFound
 	}
@@ -166,15 +201,8 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, plaintext string) (*Devi
 		return nil, ErrInvalidAPIKey
 	}
 	digest := hashAPIKey(plaintext)
-	const q = `
-        SELECT id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-               api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at
-        FROM iot_devices WHERE api_key_hash = $1`
-	var d Device
-	err := s.op().QueryRow(ctx, q, digest).Scan(
-		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-	)
+	q := `SELECT ` + deviceCols + ` FROM iot_devices WHERE api_key_hash = $1`
+	d, err := scanDevice(s.op().QueryRow(ctx, q, digest))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrInvalidAPIKey
 	}
@@ -193,6 +221,16 @@ type UpdateDeviceInput struct {
 	Label     *string
 	VehicleID *string
 	IsActive  *bool
+	// Model is settable after the fact on purpose: the usual way it becomes
+	// known is someone reading it off the unit during a fitment, which is after
+	// the device row was created from a packing list.
+	Model *string
+	// Fuel sensor mapping (migration 0047). Calibrating a probe is inherently an
+	// edit — the scale is measured against a known tank level once the sensor is
+	// in the vehicle, not known when the device is registered.
+	FuelIOID   *uint16
+	FuelScale  *float64
+	FuelOffset *float64
 }
 
 func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput) (*Device, error) {
@@ -211,19 +249,45 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
 	if in.IsActive != nil {
 		activeVal = *in.IsActive
 	}
-	const q = `
+	modelSet := in.Model != nil
+	modelVal := ""
+	if in.Model != nil {
+		modelVal = *in.Model
+	}
+	fuelIOSet := in.FuelIOID != nil
+	fuelIOVal := 0
+	if in.FuelIOID != nil {
+		fuelIOVal = int(*in.FuelIOID)
+	}
+	fuelScaleSet := in.FuelScale != nil
+	fuelScaleVal := 0.0
+	if in.FuelScale != nil {
+		fuelScaleVal = *in.FuelScale
+	}
+	fuelOffsetSet := in.FuelOffset != nil
+	fuelOffsetVal := 0.0
+	if in.FuelOffset != nil {
+		fuelOffsetVal = *in.FuelOffset
+	}
+	q := `
         UPDATE iot_devices SET
-            label      = CASE WHEN $2 THEN $3::text ELSE label END,
-            vehicle_id = CASE WHEN $4 THEN NULLIF($5::text, '') ELSE vehicle_id END,
-            is_active  = CASE WHEN $6 THEN $7::bool ELSE is_active END
+            label       = CASE WHEN $2  THEN $3::text  ELSE label END,
+            vehicle_id  = CASE WHEN $4  THEN NULLIF($5::text, '') ELSE vehicle_id END,
+            is_active   = CASE WHEN $6  THEN $7::bool  ELSE is_active END,
+            model       = CASE WHEN $8  THEN $9::text  ELSE model END,
+            fuel_io_id  = CASE WHEN $10 THEN $11::int  ELSE fuel_io_id END,
+            fuel_scale  = CASE WHEN $12 THEN $13::double precision ELSE fuel_scale END,
+            fuel_offset = CASE WHEN $14 THEN $15::double precision ELSE fuel_offset END
         WHERE id = $1
-        RETURNING id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
-                  api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at`
-	var d Device
-	err := s.op().QueryRow(ctx, q, id, labelSet, labelVal, vehicleSet, vehicleVal, activeSet, activeVal).Scan(
-		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
-		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
-	)
+        RETURNING ` + deviceCols
+	d, err := scanDevice(s.op().QueryRow(ctx, q, id,
+		labelSet, labelVal,
+		vehicleSet, vehicleVal,
+		activeSet, activeVal,
+		modelSet, modelVal,
+		fuelIOSet, fuelIOVal,
+		fuelScaleSet, fuelScaleVal,
+		fuelOffsetSet, fuelOffsetVal))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceNotFound
 	}

@@ -47,19 +47,52 @@ restartPolicyMaxRetries = 3
 # PORT to Railway is fine — do not also set ADDR, or PORT is ignored and the
 # healthcheck hits a port nothing is listening on.
 #
-# Required variables:
-#   DATABASE_URL           telemetry schema (telemetry_timeseries)
-#   REGISTRY_DATABASE_URL  operational fleet DB — iot_devices lookup for API-key
-#                          auth, and SyncVehicleFromPing writing vehicles.lat/
-#                          lng/speed/last_seen. Without it a ping is stored but
-#                          the live map never moves. Same DSN as fleet's
-#                          DATABASE_URL on the shared-database topology.
+# ── Variables ─────────────────────────────────────────────────────────────────
+#
+#   DATABASE_URL   REQUIRED. Copy the fleet service's DATABASE_URL verbatim.
+#
+# That is the whole database configuration on the current topology, and the
+# "copy it verbatim" is load-bearing twice over:
+#
+#   * One database. The platform runs a single Postgres; telemetry is a set of
+#     tables in the `iag_fleet` schema alongside vehicles and iot_devices, not a
+#     separate database. telemetry_timeseries even carries a foreign key to
+#     iot_devices, so they cannot be split without splitting that FK.
+#
+#   * search_path. Every table this service names is UNQUALIFIED
+#     (telemetry_timeseries, iot_devices, vehicles, fleet_event_outbox, …) and
+#     pg.Connect sets no search_path of its own — unlike the fleet service,
+#     which sets `search_path = iag_fleet, public` in code. So the schema has to
+#     arrive with the connection. It does when the DSN uses a `svc_iag_fleet`
+#     role, because deploy/postgres/init/02-service-roles.sh does
+#     `ALTER ROLE ... SET search_path TO iag_fleet`.
+#
+#     Connect with a role that lacks that (Railway's default `postgres`
+#     superuser, say) and this service still starts, still passes its
+#     healthcheck, and fails every single ping with `relation
+#     "telemetry_timeseries" does not exist`. If you must use such a role,
+#     append `?search_path=iag_fleet,public` — pgx forwards unknown query
+#     params as startup runtime parameters.
+#
+#   REGISTRY_DATABASE_URL  Leave UNSET here. It exists for the split-database
+#                          topology (dedicated Timescale host), where it points
+#                          at the operational DB for the iot_devices API-key
+#                          lookup and SyncVehicleFromPing. Unset, ConnectSplit
+#                          uses one pool for both — correct when there is one
+#                          database, and it halves the connections this service
+#                          takes from a shared Postgres that has no PgBouncer.
+#
 # Optional:
-#   REDIS_URL              live SSE/WS fan-out to fleet API replicas. Without
-#                          it, a ping reaches the fleet service only via its
-#                          own polled query, so the live map lags by a tick.
-#   EVENT_BUS_ENABLED      enqueue fleet.vehicle.status_changed to the outbox
-#   LOG_FORMAT=json        matches the rest of the platform
+#   DB_MAX_CONNS=10        Default is 30, which is generous for one small
+#                          ingest against a Postgres every service shares.
+#   REDIS_URL              Live fan-out to the fleet API. Without it a ping
+#                          reaches the fleet service only via its own 3s polled
+#                          query — the live map still works, just a tick later.
+#   EVENT_BUS_ENABLED      Enqueue fleet.vehicle.status_changed to the outbox.
+#   LOG_FORMAT=json        Matches the rest of the platform.
+#
+# Note there is no OTel wiring in cmd/ingest, so OTEL_* variables are inert
+# here even though the rest of the platform reads them.
 
 # Ingest is stateless and horizontally safe — every write is
 # INSERT ... ON CONFLICT (vehicle_id, ts) DO NOTHING — but held at 1 for the

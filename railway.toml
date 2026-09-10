@@ -110,6 +110,12 @@ numReplicas = 1
 #
 #     [deploy] startCommand = "/app/gateway"      # or "/app/sinotrack"
 #
+# This works because the Dockerfile ends in CMD, not ENTRYPOINT. It used to be
+# ENTRYPOINT, which Docker APPENDS to rather than replaces — so a startCommand
+# of "/app/sinotrack" ran "/app/ingest /app/sinotrack" and listened on :4080.
+# The service came up healthy and no tracker could reach it. If anyone changes
+# that line back to ENTRYPOINT, both TCP listeners break silently.
+#
 # and note the ST-901 caveat in docs/ST-901-onboarding.md: most firmwares want a
 # literal IP address, and a Railway TCP Proxy gives a domain:port. If the
 # firmware will not take a hostname, terminate those on something with a stable

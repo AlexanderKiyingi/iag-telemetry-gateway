@@ -35,6 +35,16 @@ type Device struct {
 	// Protocol is the wire protocol last seen from this device. Set on connect,
 	// so a unit dialling the wrong gateway is visible without reading logs.
 	Protocol string `json:"protocol,omitempty"`
+	// DeviceType separates hardware that dials in from hardware that does not.
+	// gps_tracker owns a serial and a network identity; fuel_sensor is wired
+	// into a tracker's IO and reports through it, which is why the fuel columns
+	// below belong to the HOST tracker rather than to the probe's own row.
+	// Empty means unknown — rows predating fleet migration 0051.
+	DeviceType string `json:"deviceType,omitempty"`
+	// Brand is validated against the server's hardware catalogue at
+	// registration, so "SinoTrack", "Sinotrack" and "ST" stop being three
+	// different manufacturers. "Other" records hardware with no decoder.
+	Brand string `json:"brand,omitempty"`
 	// Fuel sensor mapping (fleet migration 0047). Which IO element carries fuel
 	// and how its raw units become a percentage differs per sensor: CAN reports
 	// tenths of a percent, an analog sender reports millivolts, an LLS probe

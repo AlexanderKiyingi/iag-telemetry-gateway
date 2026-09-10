@@ -62,6 +62,11 @@ type CreateDeviceInput struct {
 	// had no writer at all until now, so it stayed empty however a device was
 	// provisioned and both features were unreachable.
 	Model string
+	// DeviceType and Brand are validated against the hardware catalogue before
+	// they reach here, so a stored brand always names something the platform
+	// either decodes or has explicitly recorded as undecodable ("Other").
+	DeviceType string
+	Brand      string
 	// Fuel sensor mapping. Nil keeps the column default (Teltonika CAN percent),
 	// which is what every device did before migration 0047.
 	FuelIOID   *uint16
@@ -88,6 +93,7 @@ type CreatedDevice struct {
 const deviceCols = `id, serial, COALESCE(label,''), COALESCE(vehicle_id::text,''),
                api_key_hash IS NOT NULL, is_active, last_seen, COALESCE(last_ip,''), created_at,
                COALESCE(model,''), COALESCE(protocol,''),
+               COALESCE(device_type,''), COALESCE(brand,''),
                fuel_io_id, fuel_scale, fuel_offset`
 
 // deviceScanner is satisfied by both pgx.Row and pgx.Rows.
@@ -101,6 +107,7 @@ func scanDevice(row deviceScanner) (Device, error) {
 		&d.ID, &d.Serial, &d.Label, &d.VehicleID,
 		&d.HasAPIKey, &d.IsActive, &d.LastSeen, &d.LastIP, &d.CreatedAt,
 		&d.Model, &d.Protocol,
+		&d.DeviceType, &d.Brand,
 		&d.FuelIOID, &d.FuelScale, &d.FuelOffset,
 	)
 	return d, err
@@ -122,8 +129,10 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 	// not "set it to zero".
 	q := `
         INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash, model,
+                                 device_type, brand,
                                  fuel_io_id, fuel_scale, fuel_offset)
         VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''),
+                COALESCE($9, ''), COALESCE($10, ''),
                 COALESCE(NULLIF($6, -1), 89),
                 COALESCE(NULLIF($7, 0::double precision), 0.1),
                 $8)
@@ -141,7 +150,8 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 	}
 	d, err := scanDevice(s.op().QueryRow(ctx, q,
 		in.Serial, in.Label, in.VehicleID, keyHash, in.Model,
-		fuelIO, fuelScale, fuelOffset))
+		fuelIO, fuelScale, fuelOffset,
+		in.DeviceType, in.Brand))
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +235,11 @@ type UpdateDeviceInput struct {
 	// known is someone reading it off the unit during a fitment, which is after
 	// the device row was created from a packing list.
 	Model *string
+	// DeviceType and Brand are correctable for the same reason Model is: the
+	// row is often created from a packing list and the hardware identified
+	// later, at fitment.
+	DeviceType *string
+	Brand      *string
 	// Fuel sensor mapping (migration 0047). Calibrating a probe is inherently an
 	// edit — the scale is measured against a known tank level once the sensor is
 	// in the vehicle, not known when the device is registered.
@@ -254,6 +269,16 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
 	if in.Model != nil {
 		modelVal = *in.Model
 	}
+	typeSet := in.DeviceType != nil
+	typeVal := ""
+	if in.DeviceType != nil {
+		typeVal = *in.DeviceType
+	}
+	brandSet := in.Brand != nil
+	brandVal := ""
+	if in.Brand != nil {
+		brandVal = *in.Brand
+	}
 	fuelIOSet := in.FuelIOID != nil
 	fuelIOVal := 0
 	if in.FuelIOID != nil {
@@ -277,7 +302,9 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
             model       = CASE WHEN $8  THEN $9::text  ELSE model END,
             fuel_io_id  = CASE WHEN $10 THEN $11::int  ELSE fuel_io_id END,
             fuel_scale  = CASE WHEN $12 THEN $13::double precision ELSE fuel_scale END,
-            fuel_offset = CASE WHEN $14 THEN $15::double precision ELSE fuel_offset END
+            fuel_offset = CASE WHEN $14 THEN $15::double precision ELSE fuel_offset END,
+            device_type = CASE WHEN $16 THEN $17::text ELSE device_type END,
+            brand       = CASE WHEN $18 THEN $19::text ELSE brand END
         WHERE id = $1
         RETURNING ` + deviceCols
 	d, err := scanDevice(s.op().QueryRow(ctx, q, id,
@@ -287,7 +314,9 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
 		modelSet, modelVal,
 		fuelIOSet, fuelIOVal,
 		fuelScaleSet, fuelScaleVal,
-		fuelOffsetSet, fuelOffsetVal))
+		fuelOffsetSet, fuelOffsetVal,
+		typeSet, typeVal,
+		brandSet, brandVal))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceNotFound
 	}

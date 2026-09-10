@@ -43,6 +43,19 @@ REDIS_URL=…   EVENT_BUS_ENABLED=true
 then expose `:5013` over **raw TCP** (Railway: add a **TCP Proxy** to the service — HTTP
 routing will not work).
 
+**Then tell the fleet service what that public address is:**
+
+```
+SINOTRACK_PUBLIC_ADDR=45.112.204.245:5013     # on the fleet service
+TELTONIKA_PUBLIC_ADDR=45.112.204.245:5027     # if you run that gateway too
+```
+
+Without it the operator UI cannot show anyone where to point a device — it used
+to report only "default :5013", which is a port, not an address. With it set,
+the IoT Devices screen renders the address *and the literal `804` command* for
+this deployment, so step 3 below is copied rather than transcribed. Unset is
+reported honestly as unset; nothing is ever invented.
+
 > ⚠️ **Static IP caveat.** The ST-901 `804` (set-server) command expects an **IP address**
 > on most firmwares. Railway's TCP proxy gives a *domain*:port — fine only if your unit's
 > firmware accepts a hostname. If it requires a literal IP, terminate on something with a
@@ -66,6 +79,12 @@ curl -X POST "$FLEET/api/iot/devices" \
 - **`serial`** must equal the **id the tracker transmits** in field `[1]` of its HQ frame
   (often the IMEI or the number printed on the label — see below). Not the SIM number.
 - **`issueKey:false`** — HQ devices don't use API keys.
+- **`deviceType` / `brand` / `model`** are validated against the service's hardware
+  catalogue (`GET /api/iot/catalog`), so a brand is a selection rather than a spelling
+  and `SinoTrack FMB920` is refused at registration instead of at 3am. The UI builds
+  its dropdowns from that same endpoint. Hardware with no decoder goes under brand
+  `Other`, which accepts any model — it will store and report, but nothing will parse
+  its frames.
 - Binding `vehicleId` now means hot-state, geofencing, and the live map light up on the
   first valid fix.
 
@@ -90,6 +109,7 @@ password `0000`.** Replace the IP/port/APN with yours. Reply to each is `SET OK`
 | Set APN | `803<pwd> <apn>` | `8030000 internet` |
 | APN w/ user+pass | `803<pwd> <apn> <user> <pass>` | `8030000 internet web web` |
 | Set server IP + port | `804<pwd> <ip> <port>` | `8040000 45.112.204.245 5013` |
+|      | *(the IoT Devices screen shows this line already filled in for this deployment)* | |
 | Moving (ACC-on) interval, sec | `805<pwd> <T>` | `8050000 15` |
 | Parked (ACC-off) interval, sec | `809<pwd> <T>` | `8090000 180` |
 
@@ -145,7 +165,7 @@ go run ./cmd/hqreplay -addr localhost:5013 -file captured-frames.txt
 | Geofencing | ✅ server-side (`ProcessGeofences` per fix) |
 | ACC / ignition on-off | ⚠️ in the HQ status word; **stored raw (`hqStatus`), not decoded** into `Ping.Ignition` |
 | Device alarms (vibration, power-cut, overspeed, tamper) | ⚠️ ride in V4/status frames; preserved raw, **not** turned into `safety_events` |
-| Remote engine cut-off (immobilize) | ❌ needs a server→device downlink; gateway is ingest-only |
+| Remote engine cut-off (immobilize) | ❌ the encoder registry is empty at startup — `RegisterCommandEncoder` is called only from tests, so this is unavailable for every model regardless of what `model` is set to |
 | Fuel level / theft | ❌ N/A — the ST-901 has **no fuel sensor** |
 | Odometer | ❌ not in protocol; distance derived from GPS |
 

@@ -85,6 +85,11 @@ func ConnectSplit(ctx context.Context) (registry, telemetry *pgxpool.Pool, err e
 	}
 	registryURL := strings.TrimSpace(os.Getenv("REGISTRY_DATABASE_URL"))
 	if registryURL == "" {
+		// One pool for both roles still writes pings, so it gets the same check.
+		if err := assertTelemetrySchema(ctx, telemetry); err != nil {
+			telemetry.Close()
+			return nil, nil, err
+		}
 		return telemetry, telemetry, nil
 	}
 	registry, err = Connect(ctx, registryURL)
@@ -92,7 +97,32 @@ func ConnectSplit(ctx context.Context) (registry, telemetry *pgxpool.Pool, err e
 		telemetry.Close()
 		return nil, nil, err
 	}
+	if err := assertTelemetrySchema(ctx, telemetry); err != nil {
+		telemetry.Close()
+		registry.Close()
+		return nil, nil, err
+	}
 	return registry, telemetry, nil
+}
+
+// PingsTableName is the table every gateway writes telemetry into.
+//
+// Duplicated from iot.PingsTable rather than imported, to keep this package
+// free of the domain package. iot/schema_pin_test.go fails if the two drift.
+const PingsTableName = "telemetry_timeseries"
+
+// assertTelemetrySchema stops a gateway that would write where nobody reads.
+//
+// Checked on the TELEMETRY pool only. The registry pool was never the problem:
+// device lookups and vehicle hot state kept working throughout, which is
+// precisely what made a misdirected telemetry write look like a missing
+// feature instead of a misconfiguration.
+func assertTelemetrySchema(ctx context.Context, telemetry *pgxpool.Pool) error {
+	want := strings.TrimSpace(strings.Split(SearchPath(), ",")[0])
+	if want == "" {
+		return nil
+	}
+	return AssertTableSchema(ctx, telemetry, PingsTableName, want, nil)
 }
 
 func intEnv(key string, fallback int32) int32 {

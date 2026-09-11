@@ -44,3 +44,36 @@ func TestProcessGeofences_usesActiveSet(t *testing.T) {
 		t.Fatalf("got %+v, want to be inside New Depot", tr[0])
 	}
 }
+
+// Deleting the last geofence has to mean there are no geofences.
+//
+// Before fences were editable, an empty active set could only mean "not loaded
+// yet", so falling back to the built-in six was right. Once an operator can
+// delete one it is ambiguous, and guessing wrong is the worse failure: the six
+// defaults would quietly come back, vehicles would be judged against fences
+// nobody could see in the management view, and arrivals would fire for sites
+// the operator believed they had removed.
+func TestEmptyAfterLoadMeansNoGeofences(t *testing.T) {
+	t.Cleanup(func() { SetGeofencePOIs(nil); poisLoaded.Store(false) })
+
+	SetGeofencePOIs(nil)
+	poisLoaded.Store(false)
+	if got := len(ActiveGeofencePOIs()); got != len(DefaultGeofencePOIs) {
+		t.Fatalf("before any load: %d POIs, want the %d built-in defaults", got, len(DefaultGeofencePOIs))
+	}
+
+	SetGeofencePOIsLoaded(nil)
+	if got := ActiveGeofencePOIs(); len(got) != 0 {
+		t.Fatalf("after loading an empty table: %d POIs, want none — the defaults came back", len(got))
+	}
+}
+
+// A load that never succeeded must not be mistaken for an empty table.
+func TestLoadFailureKeepsTheBuiltInSet(t *testing.T) {
+	t.Cleanup(func() { SetGeofencePOIs(nil); poisLoaded.Store(false) })
+	SetGeofencePOIs(nil)
+	poisLoaded.Store(false)
+	if got := len(ActiveGeofencePOIs()); got == 0 {
+		t.Fatal("no fences before the first successful load — a gateway that cannot reach the database would stop recording arrivals")
+	}
+}

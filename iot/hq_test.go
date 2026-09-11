@@ -2,6 +2,7 @@ package iot
 
 import (
 	"bufio"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -144,5 +145,124 @@ func TestScanHQFramesStream(t *testing.T) {
 	m1, err := ParseHQFrame(frames[1])
 	if err != nil || m1.IsPosition || m1.Type != "XT" {
 		t.Errorf("frame 1 parse: msg=%+v err=%v", m1, err)
+	}
+}
+
+// Device health rides in the optional trailing fields and was being parsed
+// past and discarded — which is why the platform could say where a tracker was
+// but nothing about the tracker itself: no battery, no signal, no way to tell a
+// flat unit from an unplugged one.
+func TestParseHQFrame_trailingHealthFields(t *testing.T) {
+	// A real ST-901 V1 frame, captured from a live unit.
+	const frame = "*HQ,866104011702712,V1,160416,A,0020.8560,N,03234.9500,E,024.30,060,110926,FFFFFDFF,639,10,100,200,5#"
+	msg, err := ParseHQFrame(frame)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !msg.IsPosition {
+		t.Fatal("expected a position frame")
+	}
+	for _, tc := range []struct {
+		name string
+		got  *int
+		want int
+	}{
+		{"mcc", msg.MCC, 639},
+		{"mnc", msg.MNC, 10},
+		{"lac", msg.LAC, 100},
+		{"cellId", msg.CellID, 200},
+		{"batteryLevel", msg.BatteryLevel, 5},
+	} {
+		if tc.got == nil {
+			t.Fatalf("%s not parsed", tc.name)
+		}
+		if *tc.got != tc.want {
+			t.Fatalf("%s = %d, want %d", tc.name, *tc.got, tc.want)
+		}
+	}
+}
+
+// A device that does not send these must yield nil, never 0. The whole purpose
+// of the fields is monitoring, and a fabricated zero reads as "battery flat" on
+// a unit that simply never reported one.
+func TestParseHQFrame_absentHealthFieldsStayNil(t *testing.T) {
+	// Same frame truncated after the status word — the layout older clones send.
+	const frame = "*HQ,866104011702712,V1,160416,A,0020.8560,N,03234.9500,E,024.30,060,110926,FFFFFDFF#"
+	msg, err := ParseHQFrame(frame)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !msg.IsPosition {
+		t.Fatal("expected a position frame")
+	}
+	for name, got := range map[string]*int{
+		"mcc": msg.MCC, "mnc": msg.MNC, "lac": msg.LAC,
+		"cellId": msg.CellID, "batteryLevel": msg.BatteryLevel,
+	} {
+		if got != nil {
+			t.Fatalf("%s should be nil when absent, got %d", name, *got)
+		}
+	}
+	// The status word is still read — absence of the tail must not lose it.
+	if msg.Status != "FFFFFDFF" {
+		t.Fatalf("status = %q, want FFFFFDFF", msg.Status)
+	}
+}
+
+// Blank and non-numeric trailing fields are gaps, not values.
+func TestParseHQFrame_junkHealthFieldsStayNil(t *testing.T) {
+	const frame = "*HQ,866104011702712,V1,160416,A,0020.8560,N,03234.9500,E,024.30,060,110926,FFFFFDFF,,x,100,200,#"
+	msg, err := ParseHQFrame(frame)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if msg.MCC != nil {
+		t.Fatalf("blank mcc should be nil, got %d", *msg.MCC)
+	}
+	if msg.MNC != nil {
+		t.Fatalf("non-numeric mnc should be nil, got %d", *msg.MNC)
+	}
+	if msg.BatteryLevel != nil {
+		t.Fatalf("blank battery should be nil, got %d", *msg.BatteryLevel)
+	}
+	// The readable ones in between are still kept.
+	if msg.LAC == nil || *msg.LAC != 100 {
+		t.Fatal("lac should still parse when a neighbour is junk")
+	}
+}
+
+// The raw blob is what reaches telemetry_timeseries.raw, so the health fields
+// have to survive into it — and absent ones must not appear at all.
+func TestHQRawJSON_carriesHealthAndOmitsAbsent(t *testing.T) {
+	full, err := ParseHQFrame("*HQ,8661,V1,160416,A,0020.8560,N,03234.9500,E,024.30,060,110926,FFFFFDFF,639,10,100,200,5#")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(full.RawJSON(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["batteryLevel"] != float64(5) {
+		t.Fatalf("batteryLevel = %v, want 5", got["batteryLevel"])
+	}
+	if got["cellId"] != float64(200) {
+		t.Fatalf("cellId = %v, want 200", got["cellId"])
+	}
+	if got["hqStatus"] != "FFFFFDFF" {
+		t.Fatalf("hqStatus = %v", got["hqStatus"])
+	}
+
+	bare, err := ParseHQFrame("*HQ,8661,V1,160416,A,0020.8560,N,03234.9500,E,024.30,060,110926,FFFFFDFF#")
+	if err != nil {
+		t.Fatalf("parse bare: %v", err)
+	}
+	var lean map[string]any
+	if err := json.Unmarshal(bare.RawJSON(), &lean); err != nil {
+		t.Fatalf("unmarshal bare: %v", err)
+	}
+	for _, key := range []string{"batteryLevel", "mcc", "mnc", "lac", "cellId"} {
+		if _, present := lean[key]; present {
+			t.Fatalf("%s must be absent, not zero, when the device did not send it", key)
+		}
 	}
 }

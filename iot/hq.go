@@ -64,6 +64,23 @@ type HQMessage struct {
 	Heading    float64
 	Status     string // raw status/alarm hex, "" when absent
 	Raw        string // the frame body between '*' and '#'
+
+	// Device health and cell context, from the optional trailing fields.
+	//
+	// These arrive on every frame an ST-901 sends and were being parsed past
+	// and thrown away, which is why the platform could show where a tracker was
+	// but nothing about the tracker itself — no battery, no signal, no way to
+	// tell a flat unit from an unplugged one.
+	//
+	// All are nil when the frame does not carry them. Firmware varies across the
+	// HQ clones, so absence is normal and is never filled in with a zero: a
+	// battery reported as 0% and a battery not reported at all are different
+	// facts, and only one of them is worth waking someone up for.
+	BatteryLevel *int // 0-100 where the firmware reports a percentage
+	MCC          *int // mobile country code
+	MNC          *int // mobile network code
+	LAC          *int // location area code
+	CellID       *int // serving cell
 }
 
 // ParseHQFrame decodes a single frame. The input may include the framing
@@ -131,6 +148,25 @@ func ParseHQFrame(frame string) (HQMessage, error) {
 	if len(fields) > 12 {
 		msg.Status = strings.TrimSpace(fields[12])
 	}
+
+	// Trailing cell + health fields, positional and firmware-dependent:
+	//
+	//	[13] mcc  [14] mnc  [15] lac  [16] cellId  [17] battery
+	//
+	// This is the ST-901 layout, confirmed against a live unit. Other HQ clones
+	// send fewer of them, or stop after the status word, so every one is read
+	// with hqOptionalInt and left nil when it is not there — no zeros invented
+	// for fields the device never sent.
+	//
+	// Read positionally because the protocol has no keys; a firmware that
+	// orders these differently will simply not produce sensible values, which
+	// is why the battery is reported as "reported by the device" downstream
+	// rather than as a calibrated measurement.
+	msg.MCC = hqOptionalInt(fields, 13)
+	msg.MNC = hqOptionalInt(fields, 14)
+	msg.LAC = hqOptionalInt(fields, 15)
+	msg.CellID = hqOptionalInt(fields, 16)
+	msg.BatteryLevel = hqOptionalInt(fields, 17)
 	return msg, nil
 }
 
@@ -140,15 +176,52 @@ func ParseHQFrame(frame string) (HQMessage, error) {
 // clones, so it is preserved verbatim rather than decoded into ignition/alarm
 // fields here; downstream consumers can interpret it per device model.
 func (m HQMessage) RawJSON() json.RawMessage {
-	out := map[string]string{"hqType": m.Type}
+	out := map[string]any{"hqType": m.Type}
 	if m.Status != "" {
 		out["hqStatus"] = m.Status
+	}
+	// Only keys the frame actually carried. An absent battery must not appear
+	// as 0 downstream — see the field comments on HQMessage.
+	if m.BatteryLevel != nil {
+		out["batteryLevel"] = *m.BatteryLevel
+	}
+	if m.MCC != nil {
+		out["mcc"] = *m.MCC
+	}
+	if m.MNC != nil {
+		out["mnc"] = *m.MNC
+	}
+	if m.LAC != nil {
+		out["lac"] = *m.LAC
+	}
+	if m.CellID != nil {
+		out["cellId"] = *m.CellID
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return json.RawMessage(`{}`)
 	}
 	return b
+}
+
+// hqOptionalInt reads a trailing field that may be absent, blank or junk.
+//
+// Returns nil rather than 0 for anything it cannot read. The whole point of
+// these fields is monitoring, and a fabricated zero is worse than a gap: it
+// reads as "battery flat" on a device that simply did not report one.
+func hqOptionalInt(fields []string, idx int) *int {
+	if idx >= len(fields) {
+		return nil
+	}
+	raw := strings.TrimSpace(fields[idx])
+	if raw == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil
+	}
+	return &v
 }
 
 func isHQHemisphere(s string) bool {

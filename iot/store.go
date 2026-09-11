@@ -113,6 +113,21 @@ func scanDevice(row deviceScanner) (Device, error) {
 	return d, err
 }
 
+// createDeviceSQL is package-level so store_sql_test.go can assert the ::uuid
+// cast is still there without needing a database — CI for this repo runs
+// `go test ./...` with no Postgres, so the integration tests skip and a typing
+// bug like the one this cast fixes reaches production untested.
+const createDeviceSQL = `
+        INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash, model,
+                                 device_type, brand,
+                                 fuel_io_id, fuel_scale, fuel_offset)
+        VALUES ($1, NULLIF($2, ''), NULLIF($3, '')::uuid, NULLIF($4, ''), NULLIF($5, ''),
+                COALESCE($9, ''), COALESCE($10, ''),
+                COALESCE(NULLIF($6, -1), 89),
+                COALESCE(NULLIF($7, 0::double precision), 0.1),
+                $8)
+        RETURNING `
+
 func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*CreatedDevice, error) {
 	var keyHash, plaintext string
 	if in.IssueKey {
@@ -127,16 +142,22 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 	// a caller that omits them sends zeros, and a zero scale violates the CHECK
 	// added in migration 0047. Omitted has to mean "keep the column default",
 	// not "set it to zero".
-	q := `
-        INSERT INTO iot_devices (serial, label, vehicle_id, api_key_hash, model,
-                                 device_type, brand,
-                                 fuel_io_id, fuel_scale, fuel_offset)
-        VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''),
-                COALESCE($9, ''), COALESCE($10, ''),
-                COALESCE(NULLIF($6, -1), 89),
-                COALESCE(NULLIF($7, 0::double precision), 0.1),
-                $8)
-        RETURNING ` + deviceCols
+	//
+	// vehicle_id needs the ::uuid, and it is not decoration. Fleet migration
+	// 0043 retyped iot_devices.vehicle_id from TEXT to uuid, and comparing a
+	// parameter with the text literal '' pins that parameter's type to text —
+	// so NULLIF($3, '') is a TEXT expression being assigned to a uuid column,
+	// which Postgres rejects outright:
+	//
+	//   column "vehicle_id" is of type uuid but expression is of type text
+	//   (SQLSTATE 42804)
+	//
+	// Registering any IoT device failed on this. It is the same 0043 fallout as
+	// the COALESCE(uuid, '') breakages fixed in the fleet service; this repo was
+	// never swept for it, and it has three of them (here, UpdateDevice, and
+	// device_commands). Reads are fine — they cast the COLUMN to text, which is
+	// the correct direction.
+	q := createDeviceSQL + deviceCols
 	fuelIO := -1
 	if in.FuelIOID != nil {
 		fuelIO = int(*in.FuelIOID)
@@ -248,6 +269,21 @@ type UpdateDeviceInput struct {
 	FuelOffset *float64
 }
 
+// updateDeviceSQL — see createDeviceSQL for why this is package-level.
+const updateDeviceSQL = `
+        UPDATE iot_devices SET
+            label       = CASE WHEN $2  THEN $3::text  ELSE label END,
+            vehicle_id  = CASE WHEN $4  THEN NULLIF($5::text, '')::uuid ELSE vehicle_id END,
+            is_active   = CASE WHEN $6  THEN $7::bool  ELSE is_active END,
+            model       = CASE WHEN $8  THEN $9::text  ELSE model END,
+            fuel_io_id  = CASE WHEN $10 THEN $11::int  ELSE fuel_io_id END,
+            fuel_scale  = CASE WHEN $12 THEN $13::double precision ELSE fuel_scale END,
+            fuel_offset = CASE WHEN $14 THEN $15::double precision ELSE fuel_offset END,
+            device_type = CASE WHEN $16 THEN $17::text ELSE device_type END,
+            brand       = CASE WHEN $18 THEN $19::text ELSE brand END
+        WHERE id = $1
+        RETURNING `
+
 func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput) (*Device, error) {
 	labelSet := in.Label != nil
 	labelVal := ""
@@ -294,19 +330,7 @@ func (s *Store) UpdateDevice(ctx context.Context, id int64, in UpdateDeviceInput
 	if in.FuelOffset != nil {
 		fuelOffsetVal = *in.FuelOffset
 	}
-	q := `
-        UPDATE iot_devices SET
-            label       = CASE WHEN $2  THEN $3::text  ELSE label END,
-            vehicle_id  = CASE WHEN $4  THEN NULLIF($5::text, '') ELSE vehicle_id END,
-            is_active   = CASE WHEN $6  THEN $7::bool  ELSE is_active END,
-            model       = CASE WHEN $8  THEN $9::text  ELSE model END,
-            fuel_io_id  = CASE WHEN $10 THEN $11::int  ELSE fuel_io_id END,
-            fuel_scale  = CASE WHEN $12 THEN $13::double precision ELSE fuel_scale END,
-            fuel_offset = CASE WHEN $14 THEN $15::double precision ELSE fuel_offset END,
-            device_type = CASE WHEN $16 THEN $17::text ELSE device_type END,
-            brand       = CASE WHEN $18 THEN $19::text ELSE brand END
-        WHERE id = $1
-        RETURNING ` + deviceCols
+	q := updateDeviceSQL + deviceCols
 	d, err := scanDevice(s.op().QueryRow(ctx, q, id,
 		labelSet, labelVal,
 		vehicleSet, vehicleVal,

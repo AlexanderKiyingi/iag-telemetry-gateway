@@ -22,6 +22,15 @@ type DeviceCommand struct {
 
 // EnqueueCommand queues a command for a device.
 //
+// insertCommandSQL is package-level so store_sql_test.go can assert the ::uuid
+// cast survives — device_commands.vehicle_id became uuid in fleet migration
+// 0043, and NULLIF($2,”) without the cast is a text expression the column
+// rejects with SQLSTATE 42804.
+const insertCommandSQL = `
+		INSERT INTO device_commands (device_id, vehicle_id, kind, requested_by, expires_at)
+		VALUES ($1, NULLIF($2,'')::uuid, $3, $4, NOW() + $5::interval)
+		RETURNING id, device_id, COALESCE(vehicle_id::text,''), kind, status, requested_by, requested_at, expires_at`
+
 // A partial unique index allows only one pending command per device, so this
 // returns ErrCommandPending rather than stacking three immobilises that would
 // all fire the moment the truck reconnects.
@@ -33,10 +42,7 @@ func (s *Store) EnqueueCommand(ctx context.Context, deviceID int64, vehicleID, k
 		ttl = DefaultInterlockConfig().MaxQueueAge
 	}
 	var c DeviceCommand
-	err := s.op().QueryRow(ctx, `
-		INSERT INTO device_commands (device_id, vehicle_id, kind, requested_by, expires_at)
-		VALUES ($1, NULLIF($2,''), $3, $4, NOW() + $5::interval)
-		RETURNING id, device_id, COALESCE(vehicle_id::text,''), kind, status, requested_by, requested_at, expires_at`,
+	err := s.op().QueryRow(ctx, insertCommandSQL,
 		deviceID, vehicleID, kind, requestedBy, ttl.String(),
 	).Scan(&c.ID, &c.DeviceID, &c.VehicleID, &c.Kind, &c.Status, &c.RequestedBy, &c.RequestedAt, &c.ExpiresAt)
 	if err != nil {

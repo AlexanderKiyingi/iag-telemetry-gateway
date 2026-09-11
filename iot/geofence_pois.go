@@ -37,20 +37,43 @@ var DefaultGeofencePOIs = []GeofencePOI{
 // only by the periodic refresh — readers must never block behind a reload.
 var activePOIs atomic.Pointer[[]GeofencePOI]
 
+// poisLoaded records that a read of geofence_pois has actually succeeded.
+//
+// It is what separates "the table says there are no fences" from "we have not
+// managed to ask yet", which an empty slice alone cannot express. Before
+// geofences were editable the difference did not arise: the table was seeded by
+// migration and only ever changed by another migration, so empty meant
+// unloaded. Now that an operator can delete one, it matters — deleting the last
+// fence has to switch site tracking off, not quietly restore the six built-in
+// ones and leave the map disagreeing with what is enforced.
+var poisLoaded atomic.Bool
+
 // ActiveGeofencePOIs returns the POIs currently in force.
+//
+// The built-in set applies only until the first successful load. After that the
+// database is the authority, including when it says there is nothing.
 func ActiveGeofencePOIs() []GeofencePOI {
-	if v := activePOIs.Load(); v != nil && len(*v) > 0 {
+	if v := activePOIs.Load(); v != nil && (len(*v) > 0 || poisLoaded.Load()) {
 		return *v
 	}
 	return DefaultGeofencePOIs
 }
 
-// SetGeofencePOIs replaces the active set. Passing an empty slice reverts to
-// the built-in defaults rather than disabling geofencing, so a truncated table
-// cannot silently switch site tracking off.
+// SetGeofencePOIs replaces the active set without claiming it came from the
+// database. Used by tests and by callers holding a set from elsewhere; a load
+// that reached the table should call SetGeofencePOIsLoaded instead, so that an
+// empty result is honoured rather than read as "not loaded yet".
 func SetGeofencePOIs(pois []GeofencePOI) {
 	cp := append([]GeofencePOI(nil), pois...)
 	activePOIs.Store(&cp)
+}
+
+// SetGeofencePOIsLoaded replaces the active set with one that came from a
+// successful read, so an empty set means no geofences rather than no answer.
+func SetGeofencePOIsLoaded(pois []GeofencePOI) {
+	cp := append([]GeofencePOI(nil), pois...)
+	activePOIs.Store(&cp)
+	poisLoaded.Store(true)
 }
 
 // LoadGeofencePOIs reads the active POIs from the database.
@@ -118,6 +141,76 @@ func (s *Store) RefreshGeofencePOIs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	SetGeofencePOIs(pois)
+	// Loaded, so an empty result is an answer: no active fences. Only a read
+	// that never succeeded leaves the built-in set in force.
+	SetGeofencePOIsLoaded(pois)
 	return nil
+}
+
+// GeofencePOIRecord is a POI as an operator manages it, rather than as the
+// evaluator consumes it: the evaluator only ever sees active fences, so
+// GeofencePOI has no is_active field to speak of.
+type GeofencePOIRecord struct {
+	GeofencePOI
+	IsActive  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ListGeofencePOIs reads every POI, active or not.
+//
+// Distinct from LoadGeofencePOIs, which the evaluator uses and which filters to
+// active rows. A management view that hid deactivated fences would offer no way
+// to turn one back on.
+func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, error) {
+	rows, err := s.op().Query(ctx, `
+		SELECT name, lat, lng, COALESCE(type,'site'), radius_km, is_active, created_at, updated_at
+		  FROM geofence_pois
+		 ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []GeofencePOIRecord{}
+	for rows.Next() {
+		var p GeofencePOIRecord
+		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm,
+			&p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UpsertGeofencePOI creates a POI or updates the one with that name.
+//
+// name is the primary key, so this is an upsert rather than separate create and
+// update paths — and renaming a fence is therefore a delete plus a create, which
+// is correct: vehicle_geofence_state is keyed by poi_name, so a rename starts
+// the enter/exit state fresh rather than inheriting another fence's history.
+func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) error {
+	_, err := s.op().Exec(ctx, `
+		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active)
+		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6)
+		ON CONFLICT (name) DO UPDATE SET
+			lat        = EXCLUDED.lat,
+			lng        = EXCLUDED.lng,
+			type       = EXCLUDED.type,
+			radius_km  = EXCLUDED.radius_km,
+			is_active  = EXCLUDED.is_active,
+			updated_at = NOW()`,
+		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive)
+	return err
+}
+
+// DeleteGeofencePOI removes a POI. Reports whether a row was actually removed,
+// so the caller can answer 404 rather than pretending a typo succeeded.
+func (s *Store) DeleteGeofencePOI(ctx context.Context, name string) (bool, error) {
+	tag, err := s.op().Exec(ctx, `DELETE FROM geofence_pois WHERE name = $1`, name)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }

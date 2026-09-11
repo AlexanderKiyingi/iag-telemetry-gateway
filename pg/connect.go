@@ -55,7 +55,24 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	// carries a safety net for "deployments whose DATABASE_URL ever lacked the
 	// ?search_path= param". This side had neither defence. Matching it means the
 	// two agree by default instead of by configuration.
-	cfg.ConnConfig.RuntimeParams["search_path"] = SearchPath()
+	// Only when the DSN does not name one.
+	//
+	// Pinning this unconditionally was wrong, and it was my own fix. Fleet owns
+	// TWO schemas on the shared database — one relational, one for time-series —
+	// and DATABASE_URL here carries the telemetry schema in its search_path.
+	// Forcing "iag_fleet, public" over it would have sent every ping WRITE to
+	// the relational schema, which is the opposite of the bug it was meant to
+	// solve. The boot assertion below caught it and refused to start, which is
+	// the only reason it never wrote a single row to the wrong place.
+	//
+	// The default still applies when the DSN is silent, which is what stops a
+	// dropped param landing writes in public.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	if strings.TrimSpace(cfg.ConnConfig.RuntimeParams["search_path"]) == "" {
+		cfg.ConnConfig.RuntimeParams["search_path"] = SearchPath()
+	}
 
 	cfg.MaxConns = intEnv("DB_MAX_CONNS", 30)
 	cfg.MinConns = intEnv("DB_MIN_CONNS", 2)
@@ -118,7 +135,16 @@ const PingsTableName = "telemetry_timeseries"
 // precisely what made a misdirected telemetry write look like a missing
 // feature instead of a misconfiguration.
 func assertTelemetrySchema(ctx context.Context, telemetry *pgxpool.Pool) error {
-	want := strings.TrimSpace(strings.Split(SearchPath(), ",")[0])
+	// Expect the first schema on the connection's OWN search_path, read back
+	// from the server rather than from this process's idea of it. The DSN may
+	// name a schema — fleet keeps its time-series data in one — and asserting
+	// against a hardcoded default would fail every correctly configured
+	// deployment while passing the misconfigured one.
+	var effective string
+	if err := telemetry.QueryRow(ctx, `SELECT current_setting('search_path')`).Scan(&effective); err != nil {
+		return fmt.Errorf("read search_path: %w", err)
+	}
+	want := strings.Trim(strings.TrimSpace(strings.Split(effective, ",")[0]), `"`)
 	if want == "" {
 		return nil
 	}

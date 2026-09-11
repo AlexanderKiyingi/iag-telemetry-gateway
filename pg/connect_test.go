@@ -85,3 +85,44 @@ func TestConnect_emptyURLIsRejected(t *testing.T) {
 	}
 	_ = os.Getenv
 }
+
+// Fleet keeps its time-series data in a schema of its own, named in the DSN.
+// Overriding that was my own fix and it was wrong: it would have sent every
+// ping WRITE to the relational schema, which is the opposite of the bug it was
+// meant to solve. These pin the rule that replaced it.
+func TestConnectConfig_honoursASchemaNamedInTheDsn(t *testing.T) {
+	t.Setenv("PG_SEARCH_PATH", "iag_fleet, public")
+	cfg, err := pgxpool.ParseConfig("postgres://u:p@localhost:5432/db?sslmode=disable&search_path=iag_fleet_telemetry")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	// Same rule Connect applies.
+	if strings.TrimSpace(cfg.ConnConfig.RuntimeParams["search_path"]) == "" {
+		cfg.ConnConfig.RuntimeParams["search_path"] = SearchPath()
+	}
+	if got := cfg.ConnConfig.RuntimeParams["search_path"]; got != "iag_fleet_telemetry" {
+		t.Fatalf("DSN schema was overridden: %q — writes would land in the wrong schema", got)
+	}
+}
+
+func TestConnectConfig_defaultsWhenTheDsnIsSilent(t *testing.T) {
+	// The original reason for pinning: a dropped param must not land writes in
+	// public.
+	t.Setenv("PG_SEARCH_PATH", "iag_fleet, public")
+	cfg, err := pgxpool.ParseConfig("postgres://u:p@localhost:5432/db?sslmode=disable")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	if strings.TrimSpace(cfg.ConnConfig.RuntimeParams["search_path"]) == "" {
+		cfg.ConnConfig.RuntimeParams["search_path"] = SearchPath()
+	}
+	if got := cfg.ConnConfig.RuntimeParams["search_path"]; got != "iag_fleet, public" {
+		t.Fatalf("default not applied: %q", got)
+	}
+}

@@ -248,9 +248,13 @@ type GeofencePOIRecord struct {
 // to turn one back on.
 func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, error) {
 	rows, err := s.op().Query(ctx, `
-		SELECT name, lat, lng, COALESCE(type,'site'), radius_km, is_active, created_at, updated_at
-		  FROM geofence_pois
-		 ORDER BY name`)
+		SELECT p.name, p.lat, p.lng, COALESCE(p.type,'site'), p.radius_km,
+		       COALESCE(p.rule,'watch'), p.is_active, p.created_at, p.updated_at,
+		       COALESCE(array_agg(v.vehicle_id::text) FILTER (WHERE v.vehicle_id IS NOT NULL), '{}')
+		  FROM geofence_pois p
+		  LEFT JOIN geofence_vehicles v ON v.poi_name = p.name
+		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule, p.is_active, p.created_at, p.updated_at
+		 ORDER BY p.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -259,10 +263,12 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 	out := []GeofencePOIRecord{}
 	for rows.Next() {
 		var p GeofencePOIRecord
+		var rule string
 		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm,
-			&p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			&rule, &p.IsActive, &p.CreatedAt, &p.UpdatedAt, &p.VehicleIDs); err != nil {
 			return nil, err
 		}
+		p.Rule = ParseGeofenceRule(rule)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -276,16 +282,17 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 // the enter/exit state fresh rather than inheriting another fence's history.
 func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) error {
 	_, err := s.op().Exec(ctx, `
-		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active)
-		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6)
+		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active, rule)
+		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6, $7)
 		ON CONFLICT (name) DO UPDATE SET
 			lat        = EXCLUDED.lat,
 			lng        = EXCLUDED.lng,
 			type       = EXCLUDED.type,
 			radius_km  = EXCLUDED.radius_km,
 			is_active  = EXCLUDED.is_active,
+			rule       = EXCLUDED.rule,
 			updated_at = NOW()`,
-		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive)
+		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive, string(ParseGeofenceRule(string(p.Rule))))
 	return err
 }
 
@@ -293,6 +300,63 @@ func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) erro
 // so the caller can answer 404 rather than pretending a typo succeeded.
 func (s *Store) DeleteGeofencePOI(ctx context.Context, name string) (bool, error) {
 	tag, err := s.op().Exec(ctx, `DELETE FROM geofence_pois WHERE name = $1`, name)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SetGeofenceVehicles replaces a fence's assignments.
+//
+// Replace rather than merge: the caller sends the set it wants, and a
+// diff-based API would leave a removed vehicle assigned whenever a request was
+// lost. Deleting then inserting in one transaction means a reader never sees a
+// fence briefly scoped to nothing — which, since empty means EVERY vehicle,
+// would be a moment where the fence silently applied to the whole fleet.
+//
+// An empty list clears the scope, and that is meaningful: it returns the fence
+// to fleet-wide.
+func (s *Store) SetGeofenceVehicles(ctx context.Context, poiName string, vehicleIDs []string) error {
+	tx, err := s.op().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM geofence_vehicles WHERE poi_name = $1`, poiName); err != nil {
+		return err
+	}
+	for _, id := range vehicleIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		// Cast explicitly: vehicles.id is uuid since migration 0043, and
+		// binding a Go string without the cast pins the parameter to text —
+		// which Postgres refuses to compare against a uuid column. That exact
+		// mistake took out the device write path once already.
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO geofence_vehicles (poi_name, vehicle_id) VALUES ($1, $2::uuid)
+			 ON CONFLICT DO NOTHING`, poiName, strings.TrimSpace(id)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// RenameGeofencePOI moves a fence to a new name, carrying its assignments.
+//
+// An UPDATE rather than the create-plus-delete the handler used to do, because
+// geofence_vehicles references the name ON UPDATE CASCADE: recreating the row
+// under a new name would drop every vehicle assigned to it, silently returning
+// the fence to fleet-wide.
+//
+// vehicle_geofence_state is deliberately NOT carried. It has no foreign key and
+// is keyed by name, so the old rows are left inert and the renamed fence starts
+// its enter/exit state fresh — which is the intended behaviour, since inheriting
+// another fence's history would fire arrivals for crossings that never happened.
+func (s *Store) RenameGeofencePOI(ctx context.Context, from, to string) (bool, error) {
+	tag, err := s.op().Exec(ctx,
+		`UPDATE geofence_pois SET name = $2, updated_at = NOW() WHERE name = $1`, from, to)
 	if err != nil {
 		return false, err
 	}

@@ -3,9 +3,45 @@ package iot
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 )
+
+// GeofenceRule says what a crossing MEANS for this fence.
+//
+// Until now every fence meant the same thing — log the crossing — which is fine
+// for a depot and wrong for the two cases an operator actually wants to be
+// woken for: a vehicle leaving a corridor it was supposed to stay in, and a
+// vehicle entering somewhere it was not supposed to go.
+type GeofenceRule string
+
+const (
+	// RuleWatch logs arrivals and departures. The behaviour every fence had
+	// before rules existed, and the default for anything unrecognised.
+	RuleWatch GeofenceRule = "watch"
+	// RuleStayInside treats LEAVING as the breach: permitted areas, corridors.
+	RuleStayInside GeofenceRule = "stay_inside"
+	// RuleNoEntry treats ENTERING as the breach: restricted or unsafe zones.
+	RuleNoEntry GeofenceRule = "no_entry"
+)
+
+// ParseGeofenceRule is deliberately forgiving.
+//
+// An unreadable rule falls back to watch rather than erroring, because the
+// alternative is a fence that stops being evaluated at all — and a fence
+// silently not watching is the one failure mode worse than a fence watching
+// with the wrong verb.
+func ParseGeofenceRule(v string) GeofenceRule {
+	switch GeofenceRule(strings.TrimSpace(strings.ToLower(v))) {
+	case RuleStayInside:
+		return RuleStayInside
+	case RuleNoEntry:
+		return RuleNoEntry
+	default:
+		return RuleWatch
+	}
+}
 
 // GeofencePOI is a point-of-interest with a circular geofence (km).
 type GeofencePOI struct {
@@ -14,6 +50,44 @@ type GeofencePOI struct {
 	Lng      float64
 	Type     string
 	RadiusKm float64
+	// Rule is what a crossing means. Zero value is the empty string, which
+	// AppliesTo and Breaches both read as RuleWatch.
+	Rule GeofenceRule
+	// VehicleIDs scopes the fence. EMPTY MEANS EVERY VEHICLE — not "no
+	// vehicles" — because that is what every existing fence means and because
+	// the opposite default would silently switch off monitoring the day this
+	// shipped.
+	VehicleIDs []string
+}
+
+// AppliesTo reports whether this fence is evaluated for a given vehicle.
+func (p GeofencePOI) AppliesTo(vehicleID string) bool {
+	if len(p.VehicleIDs) == 0 {
+		return true
+	}
+	for _, id := range p.VehicleIDs {
+		if id == vehicleID {
+			return true
+		}
+	}
+	return false
+}
+
+// Breaches reports whether a crossing in this direction is worth an event.
+//
+// Every crossing still updates the stored inside/outside state; this only
+// decides whether anyone is told. A "stay inside" fence that raised an event
+// each time a vehicle arrived back where it belonged would bury the one event
+// that mattered.
+func (p GeofencePOI) Breaches(entered bool) bool {
+	switch ParseGeofenceRule(string(p.Rule)) {
+	case RuleStayInside:
+		return !entered
+	case RuleNoEntry:
+		return entered
+	default:
+		return true
+	}
 }
 
 // DefaultGeofencePOIs is the built-in fallback, used when the geofence_pois
@@ -24,12 +98,12 @@ type GeofencePOI struct {
 // producing site arrivals. An empty table means "no override", never "no
 // geofences".
 var DefaultGeofencePOIs = []GeofencePOI{
-	{"Africa Coffee Park (ACP)", -0.880, 30.265, "iag", 0.6},
-	{"Rwashamaire Estate", -0.814, 30.067, "iag", 0.4},
-	{"IAG Kampala HQ", 0.327, 32.591, "iag", 0.3},
-	{"Mombasa Port", -4.050, 39.667, "port", 1.5},
-	{"Dar es Salaam Port", -6.792, 39.208, "port", 1.5},
-	{"Malaba Border (URA)", 0.637, 34.265, "border", 0.5},
+	{Name: "Africa Coffee Park (ACP)", Lat: -0.880, Lng: 30.265, Type: "iag", RadiusKm: 0.6, Rule: RuleWatch},
+	{Name: "Rwashamaire Estate", Lat: -0.814, Lng: 30.067, Type: "iag", RadiusKm: 0.4, Rule: RuleWatch},
+	{Name: "IAG Kampala HQ", Lat: 0.327, Lng: 32.591, Type: "iag", RadiusKm: 0.3, Rule: RuleWatch},
+	{Name: "Mombasa Port", Lat: -4.050, Lng: 39.667, Type: "port", RadiusKm: 1.5, Rule: RuleWatch},
+	{Name: "Dar es Salaam Port", Lat: -6.792, Lng: 39.208, Type: "port", RadiusKm: 1.5, Rule: RuleWatch},
+	{Name: "Malaba Border (URA)", Lat: 0.637, Lng: 34.265, Type: "border", RadiusKm: 0.5, Rule: RuleWatch},
 }
 
 // activePOIs holds the loaded set. An atomic pointer rather than a mutex
@@ -78,11 +152,19 @@ func SetGeofencePOIsLoaded(pois []GeofencePOI) {
 
 // LoadGeofencePOIs reads the active POIs from the database.
 func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
+	// Assignments come back with the fence in one query rather than one per
+	// fence: this runs on a timer in every gateway process, and a fan-out that
+	// grows with the number of sites is the shape the transition read already
+	// had to be rescued from.
 	rows, err := s.op().Query(ctx, `
-		SELECT name, lat, lng, COALESCE(type,'site'), radius_km
-		  FROM geofence_pois
-		 WHERE is_active
-		 ORDER BY name`)
+		SELECT p.name, p.lat, p.lng, COALESCE(p.type,'site'), p.radius_km,
+		       COALESCE(p.rule,'watch'),
+		       COALESCE(array_agg(v.vehicle_id::text) FILTER (WHERE v.vehicle_id IS NOT NULL), '{}')
+		  FROM geofence_pois p
+		  LEFT JOIN geofence_vehicles v ON v.poi_name = p.name
+		 WHERE p.is_active
+		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule
+		 ORDER BY p.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -91,9 +173,11 @@ func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
 	var out []GeofencePOI
 	for rows.Next() {
 		var p GeofencePOI
-		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm); err != nil {
+		var rule string
+		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm, &rule, &p.VehicleIDs); err != nil {
 			return nil, err
 		}
+		p.Rule = ParseGeofenceRule(rule)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -164,9 +248,13 @@ type GeofencePOIRecord struct {
 // to turn one back on.
 func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, error) {
 	rows, err := s.op().Query(ctx, `
-		SELECT name, lat, lng, COALESCE(type,'site'), radius_km, is_active, created_at, updated_at
-		  FROM geofence_pois
-		 ORDER BY name`)
+		SELECT p.name, p.lat, p.lng, COALESCE(p.type,'site'), p.radius_km,
+		       COALESCE(p.rule,'watch'), p.is_active, p.created_at, p.updated_at,
+		       COALESCE(array_agg(v.vehicle_id::text) FILTER (WHERE v.vehicle_id IS NOT NULL), '{}')
+		  FROM geofence_pois p
+		  LEFT JOIN geofence_vehicles v ON v.poi_name = p.name
+		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule, p.is_active, p.created_at, p.updated_at
+		 ORDER BY p.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -175,10 +263,12 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 	out := []GeofencePOIRecord{}
 	for rows.Next() {
 		var p GeofencePOIRecord
+		var rule string
 		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm,
-			&p.IsActive, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			&rule, &p.IsActive, &p.CreatedAt, &p.UpdatedAt, &p.VehicleIDs); err != nil {
 			return nil, err
 		}
+		p.Rule = ParseGeofenceRule(rule)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -192,16 +282,17 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 // the enter/exit state fresh rather than inheriting another fence's history.
 func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) error {
 	_, err := s.op().Exec(ctx, `
-		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active)
-		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6)
+		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active, rule)
+		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6, $7)
 		ON CONFLICT (name) DO UPDATE SET
 			lat        = EXCLUDED.lat,
 			lng        = EXCLUDED.lng,
 			type       = EXCLUDED.type,
 			radius_km  = EXCLUDED.radius_km,
 			is_active  = EXCLUDED.is_active,
+			rule       = EXCLUDED.rule,
 			updated_at = NOW()`,
-		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive)
+		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive, string(ParseGeofenceRule(string(p.Rule))))
 	return err
 }
 
@@ -209,6 +300,63 @@ func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) erro
 // so the caller can answer 404 rather than pretending a typo succeeded.
 func (s *Store) DeleteGeofencePOI(ctx context.Context, name string) (bool, error) {
 	tag, err := s.op().Exec(ctx, `DELETE FROM geofence_pois WHERE name = $1`, name)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SetGeofenceVehicles replaces a fence's assignments.
+//
+// Replace rather than merge: the caller sends the set it wants, and a
+// diff-based API would leave a removed vehicle assigned whenever a request was
+// lost. Deleting then inserting in one transaction means a reader never sees a
+// fence briefly scoped to nothing — which, since empty means EVERY vehicle,
+// would be a moment where the fence silently applied to the whole fleet.
+//
+// An empty list clears the scope, and that is meaningful: it returns the fence
+// to fleet-wide.
+func (s *Store) SetGeofenceVehicles(ctx context.Context, poiName string, vehicleIDs []string) error {
+	tx, err := s.op().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM geofence_vehicles WHERE poi_name = $1`, poiName); err != nil {
+		return err
+	}
+	for _, id := range vehicleIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		// Cast explicitly: vehicles.id is uuid since migration 0043, and
+		// binding a Go string without the cast pins the parameter to text —
+		// which Postgres refuses to compare against a uuid column. That exact
+		// mistake took out the device write path once already.
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO geofence_vehicles (poi_name, vehicle_id) VALUES ($1, $2::uuid)
+			 ON CONFLICT DO NOTHING`, poiName, strings.TrimSpace(id)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// RenameGeofencePOI moves a fence to a new name, carrying its assignments.
+//
+// An UPDATE rather than the create-plus-delete the handler used to do, because
+// geofence_vehicles references the name ON UPDATE CASCADE: recreating the row
+// under a new name would drop every vehicle assigned to it, silently returning
+// the fence to fleet-wide.
+//
+// vehicle_geofence_state is deliberately NOT carried. It has no foreign key and
+// is keyed by name, so the old rows are left inert and the renamed fence starts
+// its enter/exit state fresh — which is the intended behaviour, since inheriting
+// another fence's history would fire arrivals for crossings that never happened.
+func (s *Store) RenameGeofencePOI(ctx context.Context, from, to string) (bool, error) {
+	tag, err := s.op().Exec(ctx,
+		`UPDATE geofence_pois SET name = $2, updated_at = NOW() WHERE name = $1`, from, to)
 	if err != nil {
 		return false, err
 	}

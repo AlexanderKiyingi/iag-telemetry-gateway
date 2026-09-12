@@ -12,6 +12,9 @@ type GeofenceTransition struct {
 	POIName string
 	Entered bool
 	Ping    Ping
+	// Rule decides whether this crossing is worth telling anyone about. The
+	// state is recorded either way.
+	Rule GeofenceRule
 }
 
 // ProcessGeofences compares the ping position to configured POIs and returns transitions.
@@ -25,8 +28,15 @@ func ProcessGeofences(p Ping) []GeofenceTransition {
 	}
 	var out []GeofenceTransition
 	for _, poi := range ActiveGeofencePOIs() {
+		// A fence scoped to particular vehicles is not evaluated for the rest.
+		// Without this a customer-site fence raised arrivals for all 37 trucks,
+		// and the events for the two that actually serve the site were lost in
+		// the noise from the thirty-five that never go there.
+		if !poi.AppliesTo(p.VehicleID) {
+			continue
+		}
 		inside := InsideGeofence(p.Lat, p.Lng, poi.Lat, poi.Lng, poi.RadiusKm)
-		out = append(out, GeofenceTransition{POIName: poi.Name, Entered: inside, Ping: p})
+		out = append(out, GeofenceTransition{POIName: poi.Name, Entered: inside, Ping: p, Rule: poi.Rule})
 	}
 	return out
 }
@@ -80,6 +90,12 @@ func (s *Store) ApplyGeofenceTransitions(ctx context.Context, transitions []Geof
 		}
 		if !known {
 			// First observation — record state only, no alert.
+			continue
+		}
+		// The state above is recorded for every crossing; only a breach is
+		// reported. A "stay inside" fence raising an event each time a vehicle
+		// arrived back where it belonged would bury the one event that matters.
+		if !(GeofencePOI{Rule: tr.Rule}).Breaches(tr.Entered) {
 			continue
 		}
 		if err := s.insertGeofenceSafetyEvent(ctx, tr); err != nil {
@@ -138,8 +154,22 @@ func (s *Store) insertGeofenceSafetyEvent(ctx context.Context, tr GeofenceTransi
 		eventType = "Near-miss"
 		severity = "info"
 	}
-	id := fmt.Sprintf("SAF-GEO-%s-%s-%d", tr.Ping.VehicleID, geofencePOIKey(tr.POIName), tr.Ping.TS.Unix())
 	desc := fmt.Sprintf("Vehicle %s geofence %s %s", tr.Ping.VehicleID, tr.POIName, action)
+
+	// A rule changes what the crossing IS, so it changes how it reads in the
+	// safety log. "exited Northern Corridor" and "left permitted area Northern
+	// Corridor" are the same fact and a very different instruction to whoever
+	// picks the event up.
+	switch ParseGeofenceRule(string(tr.Rule)) {
+	case RuleStayInside:
+		eventType, severity = "Driver behaviour", "crit"
+		desc = fmt.Sprintf("Vehicle %s left permitted area %s", tr.Ping.VehicleID, tr.POIName)
+	case RuleNoEntry:
+		eventType, severity = "Driver behaviour", "crit"
+		desc = fmt.Sprintf("Vehicle %s entered restricted area %s", tr.Ping.VehicleID, tr.POIName)
+	}
+
+	id := fmt.Sprintf("SAF-GEO-%s-%s-%d", tr.Ping.VehicleID, geofencePOIKey(tr.POIName), tr.Ping.TS.Unix())
 	loc := fmt.Sprintf("%s · %.4f, %.4f", tr.POIName, tr.Ping.Lat, tr.Ping.Lng)
 	const q = `
         INSERT INTO safety_events (

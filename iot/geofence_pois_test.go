@@ -13,7 +13,7 @@ func TestActiveGeofencePOIs_fallsBackWhenUnset(t *testing.T) {
 }
 
 func TestSetGeofencePOIs_overridesAndIsolates(t *testing.T) {
-	custom := []GeofencePOI{{"New Depot", 0.5, 32.6, "site", 1.2}}
+	custom := []GeofencePOI{{Name: "New Depot", Lat: 0.5, Lng: 32.6, Type: "site", RadiusKm: 1.2}}
 	SetGeofencePOIs(custom)
 	t.Cleanup(func() { SetGeofencePOIs(nil) })
 
@@ -33,7 +33,7 @@ func TestSetGeofencePOIs_overridesAndIsolates(t *testing.T) {
 // A ping is evaluated against whatever set is active, so a DB-loaded POI must
 // produce transitions exactly like a built-in one.
 func TestProcessGeofences_usesActiveSet(t *testing.T) {
-	SetGeofencePOIs([]GeofencePOI{{"New Depot", 0.5, 32.6, "site", 1.0}})
+	SetGeofencePOIs([]GeofencePOI{{Name: "New Depot", Lat: 0.5, Lng: 32.6, Type: "site", RadiusKm: 1.0}})
 	t.Cleanup(func() { SetGeofencePOIs(nil) })
 
 	tr := ProcessGeofences(Ping{VehicleID: "V1", Lat: 0.5005, Lng: 32.6005})
@@ -75,5 +75,100 @@ func TestLoadFailureKeepsTheBuiltInSet(t *testing.T) {
 	poisLoaded.Store(false)
 	if got := len(ActiveGeofencePOIs()); got == 0 {
 		t.Fatal("no fences before the first successful load — a gateway that cannot reach the database would stop recording arrivals")
+	}
+}
+
+// Scoping a fence to particular vehicles.
+//
+// Empty means EVERY vehicle, not none. Getting that default backwards would
+// have switched off monitoring for every fence that already existed, silently,
+// on the day this shipped.
+func TestAppliesTo(t *testing.T) {
+	all := GeofencePOI{Name: "Depot"}
+	if !all.AppliesTo("V1") || !all.AppliesTo("anything") {
+		t.Fatal("an unscoped fence must apply to every vehicle")
+	}
+
+	scoped := GeofencePOI{Name: "Client A", VehicleIDs: []string{"V1", "V2"}}
+	if !scoped.AppliesTo("V1") || !scoped.AppliesTo("V2") {
+		t.Fatal("an assigned vehicle must be evaluated")
+	}
+	if scoped.AppliesTo("V3") {
+		t.Fatal("a vehicle that is not assigned must not be evaluated")
+	}
+}
+
+func TestProcessGeofences_skipsUnassignedVehicles(t *testing.T) {
+	// The point of the whole feature: a customer-site fence used to raise
+	// arrivals for all 37 trucks, and the events for the two that serve the
+	// site were lost in the noise from the thirty-five that never go there.
+	SetGeofencePOIs([]GeofencePOI{
+		{Name: "Client A", Lat: 0.5, Lng: 32.6, Type: "site", RadiusKm: 1.0, VehicleIDs: []string{"V1"}},
+	})
+	t.Cleanup(func() { SetGeofencePOIs(nil) })
+
+	at := Ping{Lat: 0.5005, Lng: 32.6005}
+
+	at.VehicleID = "V1"
+	if got := ProcessGeofences(at); len(got) != 1 {
+		t.Fatalf("assigned vehicle: %d transitions, want 1", len(got))
+	}
+	at.VehicleID = "V2"
+	if got := ProcessGeofences(at); len(got) != 0 {
+		t.Fatalf("unassigned vehicle: %d transitions, want 0", len(got))
+	}
+}
+
+func TestProcessGeofences_carriesTheRule(t *testing.T) {
+	SetGeofencePOIs([]GeofencePOI{
+		{Name: "Corridor", Lat: 0.5, Lng: 32.6, Type: "site", RadiusKm: 1.0, Rule: RuleStayInside},
+	})
+	t.Cleanup(func() { SetGeofencePOIs(nil) })
+	got := ProcessGeofences(Ping{VehicleID: "V1", Lat: 0.5005, Lng: 32.6005})
+	if len(got) != 1 || got[0].Rule != RuleStayInside {
+		t.Fatalf("rule not carried into the transition: %+v", got)
+	}
+}
+
+// Which direction of crossing is worth waking someone for.
+func TestBreaches(t *testing.T) {
+	cases := []struct {
+		rule            GeofenceRule
+		onEnter, onExit bool
+	}{
+		// Watch reports both, exactly as every fence did before rules existed.
+		{RuleWatch, true, true},
+		// A permitted area: leaving is the breach, arriving back is not news.
+		{RuleStayInside, false, true},
+		// A restricted zone: entering is the breach, leaving is the relief.
+		{RuleNoEntry, true, false},
+		// Anything unreadable behaves as watch — a fence that silently stopped
+		// watching would be worse than one watching with the wrong verb.
+		{GeofenceRule("nonsense"), true, true},
+		{GeofenceRule(""), true, true},
+	}
+	for _, tc := range cases {
+		p := GeofencePOI{Rule: tc.rule}
+		if got := p.Breaches(true); got != tc.onEnter {
+			t.Errorf("%q on enter = %v, want %v", tc.rule, got, tc.onEnter)
+		}
+		if got := p.Breaches(false); got != tc.onExit {
+			t.Errorf("%q on exit = %v, want %v", tc.rule, got, tc.onExit)
+		}
+	}
+}
+
+func TestParseGeofenceRule(t *testing.T) {
+	for in, want := range map[string]GeofenceRule{
+		"stay_inside": RuleStayInside,
+		"STAY_INSIDE": RuleStayInside,
+		" no_entry ":  RuleNoEntry,
+		"watch":       RuleWatch,
+		"":            RuleWatch,
+		"garbage":     RuleWatch,
+	} {
+		if got := ParseGeofenceRule(in); got != want {
+			t.Errorf("ParseGeofenceRule(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

@@ -1,7 +1,10 @@
 # Onboarding SinoTrack ST-901 (and HQ-protocol clones)
 
-How to bring a SinoTrack **ST-901 / ST-906 / ST-915** (or any GT06-era HQ-protocol
-clone) online against the IAG fleet platform.
+How to bring a SinoTrack **ST-901 / ST-906 / ST-915** (or any **HQ ASCII**
+`*HQ,…#` clone) online against the IAG fleet platform.
+
+Binary **GT06 / SeeWorld** units do **not** use this listener — see
+[SEEWORLD-onboarding.md](./SEEWORLD-onboarding.md) and `/app/gt06` / `/app/jt808`.
 
 The decoder and gateway already exist (`iot/hq.go`, `cmd/sinotrack`). Onboarding is
 **operational, not code** — there is no new protocol work. Three things have to be true:

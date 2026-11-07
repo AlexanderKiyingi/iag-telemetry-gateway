@@ -6,9 +6,11 @@ Fleet telemetry ingest service for the IAG platform. **iag-fleet** owns business
 
 ```text
 Devices / relays
-    ├─ TCP Teltonika (:5027)  → cmd/gateway
-    ├─ TCP SinoTrack/HQ (:5013) → cmd/sinotrack   (ST-901/906/915 + HQ clones)
-    └─ HTTP JSON (:4080)      → cmd/ingest
+    ├─ TCP Teltonika (:5027)     → cmd/gateway
+    ├─ TCP SinoTrack/HQ (:5013)  → cmd/sinotrack   (ST-901/906/915 + HQ ASCII)
+    ├─ TCP SeeWorld GT06 (:5023) → cmd/gt06        (most SeeWorld GPS SKUs)
+    ├─ TCP SeeWorld JT808 (:5015)→ cmd/jt808       (P5, W20L)
+    └─ HTTP JSON (:4080)         → cmd/ingest
               │
               ▼
     telemetry_timeseries  (TimescaleDB hypertable on ts)
@@ -36,7 +38,9 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 |--------|---------|-------------|
 | `/app/ingest` | `:4080` | `POST /v1/pings`, `POST /api/iot/pings` |
 | `/app/gateway` | `:5027` | Teltonika Codec 8/8E TCP |
-| `/app/sinotrack` | `:5013` | SinoTrack / HQ-protocol TCP (ST-901/906/915 + GT06-era clones) |
+| `/app/sinotrack` | `:5013` | SinoTrack / HQ-protocol TCP (ST-901/906/915 + HQ ASCII clones) |
+| `/app/gt06` | `:5023` | SeeWorld / Concox GT06 TCP (binary `7878`/`7979`) |
+| `/app/jt808` | `:5015` | SeeWorld JT808 TCP (P5, W20L) |
 
 ## Environment
 
@@ -49,6 +53,8 @@ Requires Postgres with the Timescale extension (see `deploy/postgres/init/00-tim
 | `ADDR` / `PORT` | no | HTTP ingest (default `:4080`) |
 | `IOT_ADDR` | no | Teltonika TCP gateway (default `:5027`) |
 | `SINOTRACK_ADDR` | no | SinoTrack/HQ TCP gateway (default `:5013`) |
+| `GT06_ADDR` | no | SeeWorld GT06 TCP gateway (default `:5023`) |
+| `JT808_ADDR` | no | SeeWorld JT808 TCP gateway (default `:5015`) |
 
 ## Fuel sensors
 

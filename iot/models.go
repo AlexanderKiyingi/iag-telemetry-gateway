@@ -54,12 +54,13 @@ type Device struct {
 	FuelOffset float64 `json:"fuelOffset"`
 }
 
-// Wire protocols a device may speak. SinoTrack ships both HQ-protocol and
-// GT06-protocol firmware depending on model and revision, which is why the
-// listener sniffs rather than assumes.
+// Wire protocols a device may speak. Each protocol has its own TCP listener
+// (HQ → cmd/sinotrack, GT06 → cmd/gt06, JT808 → cmd/jt808, Teltonika →
+// cmd/gateway). Observed protocol is recorded on connect via SetDeviceProtocol.
 const (
 	ProtocolHQ        = "hq"
 	ProtocolGT06      = "gt06"
+	ProtocolJT808     = "jt808"
 	ProtocolTeltonika = "teltonika"
 	ProtocolHTTP      = "http"
 )

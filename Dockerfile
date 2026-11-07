@@ -7,7 +7,7 @@ COPY . .
 ARG VERSION=dev
 RUN set -eu; \
     mkdir -p /out; \
-    for cmd in ./cmd/gateway ./cmd/ingest ./cmd/sinotrack; do \
+    for cmd in ./cmd/gateway ./cmd/ingest ./cmd/sinotrack ./cmd/gt06 ./cmd/jt808; do \
         name=$(basename $cmd); \
         CGO_ENABLED=0 GOOS=linux go build -trimpath \
             -ldflags="-s -w -X main.version=${VERSION}" \
@@ -18,12 +18,14 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/ /app/
 ENV ADDR=:4080 LOG_FORMAT=json
-# 4080 HTTP ingest · 5027 Teltonika Codec 8 TCP · 5013 SinoTrack/HQ TCP (ST-901/906/915)
-EXPOSE 4080 5027 5013
-# Default: HTTP ingest. One image, four binaries — pick one per service:
+# 4080 HTTP · 5027 Teltonika · 5013 SinoTrack/HQ · 5023 GT06 · 5015 JT808
+EXPOSE 4080 5027 5013 5023 5015
+# Default: HTTP ingest. One image, multiple binaries — pick one per service:
 #
 #   Teltonika Codec 8/8E TCP :5027   /app/gateway
 #   SinoTrack / HQ TCP       :5013   /app/sinotrack
+#   SeeWorld / GT06 TCP      :5023   /app/gt06
+#   SeeWorld / JT808 TCP     :5015   /app/jt808
 #   HTTP JSON ingest         :4080   /app/ingest      (this default)
 #
 # CMD, not ENTRYPOINT, and that distinction is the whole point.

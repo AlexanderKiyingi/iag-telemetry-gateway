@@ -102,13 +102,13 @@ numReplicas = 1
 
 # ── TCP listeners ─────────────────────────────────────────────────────────────
 #
-# `/app/gateway` (Teltonika Codec 8/8E, :5027) and `/app/sinotrack`
-# (SinoTrack/HQ, :5013) are NOT covered by this file. They speak raw TCP, which
-# an HTTP gateway cannot carry, so each needs its own Railway service built from
-# this same image with the entrypoint overridden and a Railway TCP Proxy in
-# front. Deploy them as separate services with:
+# `/app/gateway` (Teltonika :5027), `/app/sinotrack` (HQ :5013), `/app/gt06`
+# (SeeWorld GT06 :5023) and `/app/jt808` (SeeWorld JT808 :5015) are NOT covered
+# by this file. They speak raw TCP, which an HTTP gateway cannot carry, so each
+# needs its own Railway service built from this same image with the entrypoint
+# overridden and a Railway TCP Proxy in front. Deploy them as separate services:
 #
-#     [deploy] startCommand = "/app/gateway"      # or "/app/sinotrack"
+#     [deploy] startCommand = "/app/gateway"   # or /app/sinotrack /app/gt06 /app/jt808
 #
 # This works because the Dockerfile ends in CMD, not ENTRYPOINT. It used to be
 # ENTRYPOINT, which Docker APPENDS to rather than replaces — so a startCommand

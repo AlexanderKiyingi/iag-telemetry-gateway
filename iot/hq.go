@@ -2,9 +2,10 @@ package iot
 
 // SinoTrack / HQ-protocol parser.
 //
-// SinoTrack trackers (ST-901, ST-906, ST-915, and the many GT06-era clones
-// that share their firmware) do not speak Teltonika Codec 8. They emit ASCII
-// frames in the "HQ" protocol, delimited by '*' … '#':
+// SinoTrack trackers (ST-901, ST-906, ST-915, and HQ-ASCII clones that share
+// that firmware) do not speak Teltonika Codec 8. They emit ASCII frames in the
+// "HQ" protocol, delimited by '*' … '#'. Binary GT06 / SeeWorld units use
+// cmd/gt06 instead — this listener does not decode 0x7878 frames:
 //
 //	*HQ,9170503816,V1,123506,A,2232.6024,N,11355.7983,E,000.00,000,131216,FFFFFBFF,460,00,10342,4283#
 //

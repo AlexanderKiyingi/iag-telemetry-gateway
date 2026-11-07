@@ -70,9 +70,11 @@ type Pipeline struct {
 
 // IngestResult reports what happened, for the gateway's logging.
 type IngestResult struct {
-	Inserted      int
-	StatusChanged bool
-	NewStatus     string
+	Inserted           int
+	StatusChanged      bool
+	NewStatus          string
+	RegistrySyncFailed bool
+	RegistrySyncError  string
 }
 
 // Ingest runs the full post-decode pipeline for one batch of pings.
@@ -107,6 +109,8 @@ func (p *Pipeline) Ingest(ctx context.Context, device *Device, pings []Ping, cli
 	sync, err := p.Store.ApplyVehicleHotState(ctx, *newest)
 	if err != nil {
 		logger.Warn("registry sync failed after ingest", "vehicleId", newest.VehicleID, "err", err)
+		res.RegistrySyncFailed = true
+		res.RegistrySyncError = err.Error()
 	} else {
 		res.StatusChanged, res.NewStatus = sync.Changed, sync.NewStatus
 	}

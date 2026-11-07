@@ -102,38 +102,25 @@ func IngestHTTPBatch(ctx context.Context, store *Store, hub *Hub, apiKey string,
 			FuelLevel: b.FuelLevel, Ignition: b.Ignition, EventID: b.EventID, Raw: raw,
 		})
 	}
-	n, err := store.InsertPings(ctx, pings)
+	// Same post-decode path as the TCP gateways — do not re-implement geofence /
+	// overspeed / MarkSeen here or HTTP devices silently miss the next feature.
+	if err := store.SetDeviceProtocol(ctx, device.ID, ProtocolHTTP); err != nil {
+		slog.Warn("record device protocol failed", "deviceId", device.ID, "err", err)
+	}
+	pipe := &Pipeline{
+		Store:     store,
+		Hub:       hub,
+		Overspeed: OverspeedConfigFromEnv(),
+	}
+	ing, err := pipe.Ingest(ctx, device, pings, clientIP, slog.Default())
 	if err != nil {
 		return IngestBatchResult{}, err
 	}
-	result := IngestBatchResult{Accepted: n}
-	if newest := newestPing(pings); newest != nil && newest.VehicleID != "" {
-		if _, err := store.ApplyVehicleHotState(ctx, *newest); err != nil {
-			slog.Warn("registry sync failed after ingest",
-				"vehicleId", newest.VehicleID, "err", err)
-			result.RegistrySyncFailed = true
-			result.RegistrySyncError = err.Error()
-		}
-		if err := store.ApplyGeofenceTransitions(ctx, ProcessGeofences(*newest)); err != nil {
-			slog.Warn("geofence transitions failed after ingest",
-				"vehicleId", newest.VehicleID, "err", err)
-		}
-		// Speed monitoring applies to every ingest path, not just the TCP
-		// gateways — a vehicle relaying over HTTP is still a vehicle.
-		if err := store.ApplyOverspeed(ctx, *newest, OverspeedConfigFromEnv()); err != nil {
-			slog.Warn("overspeed evaluation failed after ingest",
-				"vehicleId", newest.VehicleID, "err", err)
-		}
-	}
-	if err := store.MarkSeen(ctx, device.ID, clientIP); err != nil {
-		slog.Warn("mark device seen failed", "deviceId", device.ID, "err", err)
-	}
-	if hub != nil {
-		for _, p := range pings {
-			hub.Publish(p)
-		}
-	}
-	return result, nil
+	return IngestBatchResult{
+		Accepted:           ing.Inserted,
+		RegistrySyncFailed: ing.RegistrySyncFailed,
+		RegistrySyncError:  ing.RegistrySyncError,
+	}, nil
 }
 
 // ReadIngestBody reads and normalizes a request body for IngestHTTPBatch.

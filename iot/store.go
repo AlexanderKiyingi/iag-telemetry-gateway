@@ -67,8 +67,9 @@ type CreateDeviceInput struct {
 	// either decodes or has explicitly recorded as undecodable ("Other").
 	DeviceType string
 	Brand      string
-	// Fuel sensor mapping. Nil keeps the column default (Teltonika CAN percent),
-	// which is what every device did before migration 0047.
+	// Fuel sensor mapping. Nil means "pick a sensible default": Teltonika CAN
+	// percent (IO 89) for brand Teltonika / unset brand; fuelIoId=0 (disabled)
+	// for every other brand so SeeWorld/HQ units do not inherit a Teltonika IO map.
 	FuelIOID   *uint16
 	FuelScale  *float64
 	FuelOffset *float64
@@ -158,9 +159,12 @@ func (s *Store) CreateDevice(ctx context.Context, in CreateDeviceInput) (*Create
 	// device_commands). Reads are fine — they cast the COLUMN to text, which is
 	// the correct direction.
 	q := createDeviceSQL + deviceCols
-	fuelIO := -1
+	fuelIO := -1 // sentinel → SQL default 89 (Teltonika CAN)
 	if in.FuelIOID != nil {
 		fuelIO = int(*in.FuelIOID)
+	} else if in.Brand != "" && !strings.EqualFold(in.Brand, "Teltonika") {
+		// SeeWorld, SinoTrack, Other, … — no CAN fuel IO on the tracker itself.
+		fuelIO = 0
 	}
 	var fuelScale, fuelOffset float64
 	if in.FuelScale != nil {
@@ -452,7 +456,8 @@ func (s *Store) RecordStatusWord(ctx context.Context, deviceID int64, frameType,
 
 // SetDeviceProtocol records the wire protocol a device was last seen speaking.
 // Cheap to keep current and the fastest way to answer "why is this unit not
-// reporting" — a GT06-firmware tracker dialling the HQ port shows up here.
+// reporting" — a unit dialling the wrong listener shows expectedProtocol vs
+// observed protocol disagreement in the device admin UI.
 func (s *Store) SetDeviceProtocol(ctx context.Context, deviceID int64, protocol string) error {
 	if deviceID == 0 || protocol == "" {
 		return nil

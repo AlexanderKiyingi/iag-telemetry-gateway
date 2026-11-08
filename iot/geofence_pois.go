@@ -2,6 +2,7 @@ package iot
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -43,13 +44,23 @@ func ParseGeofenceRule(v string) GeofenceRule {
 	}
 }
 
-// GeofencePOI is a point-of-interest with a circular geofence (km).
+// Fence shapes. Circles use Lat/Lng + RadiusKm; polygons use Vertices (Lat/Lng
+// is the centroid and RadiusKm the farthest vertex — for focus / CHECK only).
+const (
+	ShapeCircle  = "circle"
+	ShapePolygon = "polygon"
+)
+
+// GeofencePOI is a point-of-interest with a circular or polygonal geofence.
 type GeofencePOI struct {
 	Name     string
 	Lat      float64
 	Lng      float64
 	Type     string
 	RadiusKm float64
+	Shape    string
+	// Vertices is the polygon ring when Shape is polygon. Empty for circles.
+	Vertices []LatLng
 	// Rule is what a crossing means. Zero value is the empty string, which
 	// AppliesTo and Breaches both read as RuleWatch.
 	Rule GeofenceRule
@@ -58,6 +69,14 @@ type GeofencePOI struct {
 	// the opposite default would silently switch off monitoring the day this
 	// shipped.
 	VehicleIDs []string
+}
+
+// Contains reports whether a fix is inside this fence.
+func (p GeofencePOI) Contains(lat, lng float64) bool {
+	if strings.EqualFold(strings.TrimSpace(p.Shape), ShapePolygon) && len(p.Vertices) >= 3 {
+		return InsidePolygon(lat, lng, p.Vertices)
+	}
+	return InsideGeofence(lat, lng, p.Lat, p.Lng, p.RadiusKm)
 }
 
 // AppliesTo reports whether this fence is evaluated for a given vehicle.
@@ -158,12 +177,12 @@ func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
 	// had to be rescued from.
 	rows, err := s.op().Query(ctx, `
 		SELECT p.name, p.lat, p.lng, COALESCE(p.type,'site'), p.radius_km,
-		       COALESCE(p.rule,'watch'),
+		       COALESCE(p.rule,'watch'), COALESCE(p.shape,'circle'), p.vertices,
 		       COALESCE(array_agg(v.vehicle_id::text) FILTER (WHERE v.vehicle_id IS NOT NULL), '{}')
 		  FROM geofence_pois p
 		  LEFT JOIN geofence_vehicles v ON v.poi_name = p.name
 		 WHERE p.is_active
-		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule
+		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule, p.shape, p.vertices
 		 ORDER BY p.name`)
 	if err != nil {
 		return nil, err
@@ -174,10 +193,13 @@ func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
 	for rows.Next() {
 		var p GeofencePOI
 		var rule string
-		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm, &rule, &p.VehicleIDs); err != nil {
+		var vertices []byte
+		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm, &rule, &p.Shape, &vertices, &p.VehicleIDs); err != nil {
 			return nil, err
 		}
 		p.Rule = ParseGeofenceRule(rule)
+		p.Shape = normaliseShape(p.Shape)
+		p.Vertices = decodeVertices(vertices)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -249,11 +271,13 @@ type GeofencePOIRecord struct {
 func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, error) {
 	rows, err := s.op().Query(ctx, `
 		SELECT p.name, p.lat, p.lng, COALESCE(p.type,'site'), p.radius_km,
-		       COALESCE(p.rule,'watch'), p.is_active, p.created_at, p.updated_at,
+		       COALESCE(p.rule,'watch'), COALESCE(p.shape,'circle'), p.vertices,
+		       p.is_active, p.created_at, p.updated_at,
 		       COALESCE(array_agg(v.vehicle_id::text) FILTER (WHERE v.vehicle_id IS NOT NULL), '{}')
 		  FROM geofence_pois p
 		  LEFT JOIN geofence_vehicles v ON v.poi_name = p.name
-		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule, p.is_active, p.created_at, p.updated_at
+		 GROUP BY p.name, p.lat, p.lng, p.type, p.radius_km, p.rule, p.shape, p.vertices,
+		          p.is_active, p.created_at, p.updated_at
 		 ORDER BY p.name`)
 	if err != nil {
 		return nil, err
@@ -264,11 +288,14 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 	for rows.Next() {
 		var p GeofencePOIRecord
 		var rule string
+		var vertices []byte
 		if err := rows.Scan(&p.Name, &p.Lat, &p.Lng, &p.Type, &p.RadiusKm,
-			&rule, &p.IsActive, &p.CreatedAt, &p.UpdatedAt, &p.VehicleIDs); err != nil {
+			&rule, &p.Shape, &vertices, &p.IsActive, &p.CreatedAt, &p.UpdatedAt, &p.VehicleIDs); err != nil {
 			return nil, err
 		}
 		p.Rule = ParseGeofenceRule(rule)
+		p.Shape = normaliseShape(p.Shape)
+		p.Vertices = decodeVertices(vertices)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -281,9 +308,24 @@ func (s *Store) ListGeofencePOIs(ctx context.Context) ([]GeofencePOIRecord, erro
 // is correct: vehicle_geofence_state is keyed by poi_name, so a rename starts
 // the enter/exit state fresh rather than inheriting another fence's history.
 func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) error {
+	shape := normaliseShape(p.Shape)
+	var verticesJSON []byte
+	if shape == ShapePolygon {
+		if lat, lng, r, ok := CentroidAndRadiusKm(p.Vertices); ok {
+			p.Lat, p.Lng, p.RadiusKm = lat, lng, r
+		}
+		var err error
+		verticesJSON, err = json.Marshal(p.Vertices)
+		if err != nil {
+			return err
+		}
+	} else {
+		verticesJSON = nil
+		p.Vertices = nil
+	}
 	_, err := s.op().Exec(ctx, `
-		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active, rule)
-		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6, $7)
+		INSERT INTO geofence_pois (name, lat, lng, type, radius_km, is_active, rule, shape, vertices)
+		VALUES ($1, $2, $3, COALESCE(NULLIF($4,''),'site'), $5, $6, $7, $8, $9)
 		ON CONFLICT (name) DO UPDATE SET
 			lat        = EXCLUDED.lat,
 			lng        = EXCLUDED.lng,
@@ -291,9 +333,30 @@ func (s *Store) UpsertGeofencePOI(ctx context.Context, p GeofencePOIRecord) erro
 			radius_km  = EXCLUDED.radius_km,
 			is_active  = EXCLUDED.is_active,
 			rule       = EXCLUDED.rule,
+			shape      = EXCLUDED.shape,
+			vertices   = EXCLUDED.vertices,
 			updated_at = NOW()`,
-		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive, string(ParseGeofenceRule(string(p.Rule))))
+		p.Name, p.Lat, p.Lng, p.Type, p.RadiusKm, p.IsActive,
+		string(ParseGeofenceRule(string(p.Rule))), shape, verticesJSON)
 	return err
+}
+
+func normaliseShape(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), ShapePolygon) {
+		return ShapePolygon
+	}
+	return ShapeCircle
+}
+
+func decodeVertices(raw []byte) []LatLng {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var out []LatLng
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 // DeleteGeofencePOI removes a POI. Reports whether a row was actually removed,

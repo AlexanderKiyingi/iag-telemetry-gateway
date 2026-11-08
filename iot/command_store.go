@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // DeviceCommand is one queued or completed server→device command.
@@ -46,6 +47,10 @@ func (s *Store) EnqueueCommand(ctx context.Context, deviceID int64, vehicleID, k
 		deviceID, vehicleID, kind, requestedBy, ttl.String(),
 	).Scan(&c.ID, &c.DeviceID, &c.VehicleID, &c.Kind, &c.Status, &c.RequestedBy, &c.RequestedAt, &c.ExpiresAt)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, ErrCommandPending
+		}
 		return nil, err
 	}
 	return &c, nil
@@ -101,6 +106,54 @@ func (s *Store) MarkCommandRefused(ctx context.Context, id int64, reason string,
 		 WHERE id = $1`,
 		id, status, reason, snap.SpeedKmh, int(snap.FixAge.Seconds()))
 	return err
+}
+
+// ListDeviceCommands returns recent commands for a device, newest first.
+func (s *Store) ListDeviceCommands(ctx context.Context, deviceID int64, limit int) ([]DeviceCommand, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.op().Query(ctx, `
+		SELECT id, device_id, COALESCE(vehicle_id::text,''), kind, status, requested_by, requested_at, expires_at
+		  FROM device_commands
+		 WHERE device_id = $1
+		 ORDER BY requested_at DESC
+		 LIMIT $2`, deviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DeviceCommand
+	for rows.Next() {
+		var c DeviceCommand
+		if err := rows.Scan(&c.ID, &c.DeviceID, &c.VehicleID, &c.Kind, &c.Status, &c.RequestedBy, &c.RequestedAt, &c.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// FindActiveByVehicleID returns the active tracker bound to a vehicle, if any.
+// Used by the operator HTTP surface so a live-map action can target the unit
+// without the caller knowing the device row id.
+func (s *Store) FindActiveByVehicleID(ctx context.Context, vehicleID string) (*Device, error) {
+	if vehicleID == "" {
+		return nil, ErrDeviceNotFound
+	}
+	q := `SELECT ` + deviceCols + `
+	        FROM iot_devices
+	       WHERE vehicle_id = $1::uuid AND is_active = true
+	       ORDER BY last_seen DESC NULLS LAST, created_at DESC
+	       LIMIT 1`
+	d, err := scanDevice(s.op().QueryRow(ctx, q, vehicleID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeviceNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 // VehicleSnapshotFor reads the state the interlock will judge, from the

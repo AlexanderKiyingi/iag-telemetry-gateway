@@ -35,7 +35,7 @@ func ProcessGeofences(p Ping) []GeofenceTransition {
 		if !poi.AppliesTo(p.VehicleID) {
 			continue
 		}
-		inside := InsideGeofence(p.Lat, p.Lng, poi.Lat, poi.Lng, poi.RadiusKm)
+		inside := poi.Contains(p.Lat, p.Lng)
 		out = append(out, GeofenceTransition{POIName: poi.Name, Entered: inside, Ping: p, Rule: poi.Rule})
 	}
 	return out

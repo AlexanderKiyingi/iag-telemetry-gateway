@@ -205,10 +205,14 @@ func (s *Store) LoadGeofencePOIs(ctx context.Context) ([]GeofencePOI, error) {
 	return out, rows.Err()
 }
 
-// GeofenceRefreshInterval is how often StartGeofenceRefresh reloads. Geofences
-// are edited by hand and rarely, so this only needs to be short enough that a
-// change takes effect within a shift.
-const GeofenceRefreshInterval = 5 * time.Minute
+// GeofenceRefreshInterval is how often StartGeofenceRefresh reloads.
+//
+// Edits go through the fleet CRUD API, which also refreshes the in-process set
+// immediately — but gateways are separate processes and would otherwise keep
+// evaluating the previous fence for up to the old five-minute window. Thirty
+// seconds is short enough that "Save" means live soon, without hammering the
+// table on every ping.
+const GeofenceRefreshInterval = 30 * time.Second
 
 // StartGeofenceRefresh keeps the active POI set current for the life of ctx.
 //
